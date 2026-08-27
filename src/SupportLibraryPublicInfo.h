@@ -29,6 +29,10 @@ struct BuildDependencyResult {
 	std::string resolvedPath;
 };
 
+// RSCProject.fne is not safe to load from a standalone packer process. Its
+// command and constant references must remain in reversible _LibN raw form.
+bool IsUnsafeForStandaloneLoad(const std::string& libraryFileName);
+
 // 将依赖中的支持库公开信息导出到 elib/*.txt。
 ExportResult ExportDependencies(
 	const std::filesystem::path& sourcePath,

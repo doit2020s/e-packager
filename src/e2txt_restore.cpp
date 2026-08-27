@@ -28,7 +28,8 @@
 #include "EFolderCodec.h"
 #include "PathHelper.h"
 #include "SimpleXmlDocument.h"
-#include "SourcePreflightValidator.h"
+#include "SourceArrayFormatValidator.h"
+#include "SupportLibraryPublicInfo.h"
 
 namespace e2txt {
 
@@ -1897,6 +1898,7 @@ struct SupportLibraryConstantInfo {
 struct SupportLibraryTypeInfo {
 	std::int32_t typeId = 0;
 	bool isTabControl = false;
+	std::unordered_map<std::string, std::int32_t> memberIdsByName;
 	std::unordered_map<std::string, SupportLibraryCommandInfo> methodsByName;
 };
 
@@ -1904,6 +1906,45 @@ struct SupportLibraryTextTypeInfo {
 	std::string name;
 	std::vector<std::string> methodNames;
 };
+
+bool TryParseRawSupportLibrarySymbol(
+	const std::string& rawName,
+	const std::string_view kind,
+	const size_t supportLibraryCount,
+	std::int16_t& outLibraryId,
+	std::int32_t& outItemId)
+{
+	outLibraryId = 0;
+	outItemId = 0;
+	const std::string name = TrimAsciiCopy(rawName);
+	if (!StartsWith(name, "_Lib")) {
+		return false;
+	}
+	const size_t kindOffset = name.find(kind, 4);
+	if (kindOffset == std::string::npos || kindOffset == 4 || kindOffset + kind.size() >= name.size()) {
+		return false;
+	}
+
+	std::int32_t libraryId = -1;
+	std::int32_t itemId = -1;
+	const std::string_view libraryText(name.data() + 4, kindOffset - 4);
+	const std::string_view itemText(name.data() + kindOffset + kind.size(), name.size() - kindOffset - kind.size());
+	const auto [libraryEnd, libraryError] = std::from_chars(
+		libraryText.data(), libraryText.data() + libraryText.size(), libraryId);
+	const auto [itemEnd, itemError] = std::from_chars(
+		itemText.data(), itemText.data() + itemText.size(), itemId);
+	if (libraryError != std::errc() || libraryEnd != libraryText.data() + libraryText.size() ||
+		itemError != std::errc() || itemEnd != itemText.data() + itemText.size() ||
+		libraryId < 0 || itemId < 0 ||
+		static_cast<size_t>(libraryId) >= supportLibraryCount ||
+		libraryId > (std::numeric_limits<std::int16_t>::max)()) {
+		return false;
+	}
+
+	outLibraryId = static_cast<std::int16_t>(libraryId);
+	outItemId = itemId;
+	return true;
+}
 
 class TypeResolver {
 public:
@@ -1985,6 +2026,14 @@ public:
 
 	bool TryResolveSupportCommand(const std::string& rawCommandName, SupportLibraryCommandInfo& outInfo) const
 	{
+		if (TryParseRawSupportLibrarySymbol(
+				rawCommandName,
+				"Cmd",
+				m_supportLibraryOrder.size(),
+				outInfo.libraryId,
+				outInfo.commandId)) {
+			return true;
+		}
 		const std::string commandName = NormalizeTypeName(rawCommandName);
 		const auto it = m_supportCommands.find(commandName);
 		if (it == m_supportCommands.end()) {
@@ -1997,6 +2046,14 @@ public:
 
 	bool TryResolveSupportConstant(const std::string& rawConstantName, SupportLibraryConstantInfo& outInfo) const
 	{
+		if (TryParseRawSupportLibrarySymbol(
+				rawConstantName,
+				"Const",
+				m_supportLibraryOrder.size(),
+				outInfo.libraryId,
+				outInfo.constantId)) {
+			return true;
+		}
 		const std::string constantName = NormalizeTypeName(rawConstantName);
 		const auto it = m_supportConstants.find(constantName);
 		if (it == m_supportConstants.end()) {
@@ -2033,6 +2090,31 @@ public:
 			return true;
 		}
 		outInfo = {};
+		return false;
+	}
+
+	bool TryResolveSupportTypeMember(
+		const std::int32_t typeId,
+		const std::string& rawMemberName,
+		std::int32_t& outMemberId) const
+	{
+		const std::string memberName = NormalizeTypeName(rawMemberName);
+		if (memberName.empty()) {
+			outMemberId = 0;
+			return false;
+		}
+		for (const auto& [_, info] : m_supportTypes) {
+			if (info.typeId != typeId) {
+				continue;
+			}
+			const auto memberIt = info.memberIdsByName.find(memberName);
+			if (memberIt == info.memberIdsByName.end()) {
+				break;
+			}
+			outMemberId = memberIt->second;
+			return outMemberId > 0;
+		}
+		outMemberId = 0;
 		return false;
 	}
 
@@ -2251,6 +2333,10 @@ private:
 	void LoadSupportLibrary(const RestoreDependencyInfo& dependency, const int supportIndex)
 	{
 		constexpr int kMaxSupportLibraryArrayCount = 16384;
+		if (support_library_public_info::IsUnsafeForStandaloneLoad(
+				dependency.fileName.empty() ? dependency.name : dependency.fileName)) {
+			return;
+		}
 		const bool isCoreSupportLibrary = IsCoreSupportLibraryFileName(dependency.fileName);
 		const auto candidates = BuildSupportLibraryCandidatePaths(m_sourcePath, dependency.fileName);
 		const auto tryTextWorkspaceFallback = [&]() {
@@ -2329,6 +2415,16 @@ private:
 			SupportLibraryTypeInfo info;
 			info.typeId = (supportIndex << 16) | (i + 1);
 			info.isTabControl = (dataType.m_dwState & LDT_IS_TAB_UNIT) != 0;
+			const auto memberNames = BuildSupportTypeMemberNames(dataType);
+			for (size_t memberIndex = 0; memberIndex < memberNames.size(); ++memberIndex) {
+				const std::string memberName = NormalizeTypeName(memberNames[memberIndex]);
+				if (!memberName.empty()) {
+					// Native member ids are one-based while the public property table is zero-based.
+					info.memberIdsByName.insert_or_assign(
+						memberName,
+						static_cast<std::int32_t>(memberIndex + 1));
+				}
+			}
 			if (dataType.m_nCmdCount > 0 &&
 				dataType.m_nCmdCount <= kMaxSupportLibraryArrayCount &&
 				dataType.m_pnCmdsIndex != nullptr &&
@@ -4084,7 +4180,12 @@ struct NativeConstantSymbol {
 struct NativeObjectMethodEncodeContext {
 	std::unordered_map<std::string, NativeObjectVariableSymbol> variablesByName;
 	std::unordered_map<std::int32_t, std::unordered_map<std::string, NativeObjectMemberSymbol>> membersByOwnerType;
+	// A form instance owns members with its form id, but uses the core Window public property table.
+	std::unordered_map<std::int32_t, std::int32_t> supportMemberTypeByOwnerType;
 	std::unordered_map<std::string, NativeConstantSymbol> constantsByName;
+	// Local source methods own their names. Imported module methods remain fallback
+	// candidates so a same-named E support command keeps the IDE's binding.
+	std::unordered_map<std::string, NativeFunctionSymbol> localFunctionsByName;
 	std::unordered_map<std::string, NativeFunctionSymbol> functionsByName;
 	std::unordered_map<std::int32_t, std::unordered_map<std::string, NativeFunctionSymbol>> methodsByOwnerType;
 	const TypeResolver* typeResolver = nullptr;
@@ -4574,17 +4675,26 @@ bool TryResolveNativeMember(
 	NativeObjectMemberSymbol& outMember)
 {
 	const auto ownerIt = context.membersByOwnerType.find(ownerTypeId);
-	if (ownerIt == context.membersByOwnerType.end()) {
-		outMember = {};
-		return false;
+	if (ownerIt != context.membersByOwnerType.end()) {
+		const auto memberIt = ownerIt->second.find(TypeResolver::NormalizeTypeName(rawMemberName));
+		if (memberIt != ownerIt->second.end()) {
+			outMember = memberIt->second;
+			return outMember.id != 0;
+		}
 	}
-	const auto memberIt = ownerIt->second.find(TypeResolver::NormalizeTypeName(rawMemberName));
-	if (memberIt == ownerIt->second.end()) {
-		outMember = {};
-		return false;
+
+	const auto aliasIt = context.supportMemberTypeByOwnerType.find(ownerTypeId);
+	const std::int32_t supportTypeId =
+		aliasIt == context.supportMemberTypeByOwnerType.end() ? ownerTypeId : aliasIt->second;
+	std::int32_t memberId = 0;
+	if (context.typeResolver != nullptr &&
+		context.typeResolver->TryResolveSupportTypeMember(supportTypeId, rawMemberName, memberId)) {
+		outMember = NativeObjectMemberSymbol{ memberId, ownerTypeId, 0 };
+		return true;
 	}
-	outMember = memberIt->second;
-	return outMember.id != 0;
+
+	outMember = {};
+	return false;
 }
 
 bool ParseNativeVariableAccessExpression(
@@ -4798,9 +4908,9 @@ bool TryResolveNativeFunction(
 	NativeFunctionSymbol& outSymbol)
 {
 	const std::string functionKey = TypeResolver::NormalizeTypeName(rawName);
-	const auto functionIt = context.functionsByName.find(functionKey);
-	if (functionIt != context.functionsByName.end()) {
-		outSymbol = functionIt->second;
+	const auto localFunctionIt = context.localFunctionsByName.find(functionKey);
+	if (localFunctionIt != context.localFunctionsByName.end()) {
+		outSymbol = localFunctionIt->second;
 		return true;
 	}
 	if (context.typeResolver != nullptr) {
@@ -4809,6 +4919,11 @@ bool TryResolveNativeFunction(
 			outSymbol = NativeFunctionSymbol{ commandInfo.libraryId, commandInfo.commandId };
 			return true;
 		}
+	}
+	const auto functionIt = context.functionsByName.find(functionKey);
+	if (functionIt != context.functionsByName.end()) {
+		outSymbol = functionIt->second;
+		return true;
 	}
 	outSymbol = {};
 	return false;
@@ -5390,29 +5505,8 @@ bool TryEncodeNativeObjectMethodCallLine(
 		return false;
 	}
 
-	const auto ownerIt = context.methodsByOwnerType.find(targetTypeId);
-	if (ownerIt == context.methodsByOwnerType.end()) {
-		if (outError != nullptr) {
-			*outError = "owner_type_methods_missing: " + call.objectName + " type=" + std::to_string(targetTypeId);
-		}
-		return false;
-	}
-	const std::string methodKey = TypeResolver::NormalizeTypeName(call.methodName);
 	NativeFunctionSymbol methodSymbol;
-	bool hasMethodSymbol = false;
-	const auto methodIt = ownerIt->second.find(methodKey);
-	if (methodIt != ownerIt->second.end()) {
-		methodSymbol = methodIt->second;
-		hasMethodSymbol = true;
-	}
-	else if (context.typeResolver != nullptr) {
-		SupportLibraryCommandInfo supportMethod;
-		if (context.typeResolver->TryResolveSupportTypeMethod(targetTypeId, call.methodName, supportMethod)) {
-			methodSymbol = NativeFunctionSymbol{ supportMethod.libraryId, supportMethod.commandId };
-			hasMethodSymbol = true;
-		}
-	}
-	if (!hasMethodSymbol) {
+	if (!TryResolveNativeOwnerMethod(targetTypeId, call.methodName, context, methodSymbol)) {
 		if (outError != nullptr) {
 			*outError = "object_method_not_found: " + call.objectName + "." + call.methodName +
 				" type=" + std::to_string(targetTypeId);
@@ -8352,10 +8446,17 @@ bool SplitQualifiedHandlerName(const std::string& rawText, std::string& outOwner
 	return !outMethodName.empty();
 }
 
+struct PreparedFormHandlerSymbol {
+	std::int32_t ownerClassId = 0;
+	std::string methodName;
+	std::int32_t methodId = 0;
+};
+
 std::int32_t ResolveHandlerMethodId(
 	const std::string& rawHandlerName,
 	const std::int32_t preferredOwnerClassId,
-	const RestoreDocumentModel& model)
+	const RestoreDocumentModel& model,
+	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers)
 {
 	std::string ownerName;
 	std::string methodName;
@@ -8374,6 +8475,13 @@ std::int32_t ResolveHandlerMethodId(
 	}
 
 	if (resolvedOwnerClassId == 0 && preferredOwnerClassId != 0) {
+		if (preparedHandlers != nullptr) {
+			for (const auto& handler : *preparedHandlers) {
+				if (handler.ownerClassId == preferredOwnerClassId && handler.methodName == methodName) {
+					return handler.methodId;
+				}
+			}
+		}
 		for (const auto& method : model.methods) {
 			if (method.ownerClass == preferredOwnerClassId &&
 				TypeResolver::NormalizeTypeName(method.name) == methodName) {
@@ -8383,6 +8491,13 @@ std::int32_t ResolveHandlerMethodId(
 	}
 
 	if (resolvedOwnerClassId != 0) {
+		if (preparedHandlers != nullptr) {
+			for (const auto& handler : *preparedHandlers) {
+				if (handler.ownerClassId == resolvedOwnerClassId && handler.methodName == methodName) {
+					return handler.methodId;
+				}
+			}
+		}
 		for (const auto& method : model.methods) {
 			if (method.ownerClass == resolvedOwnerClassId &&
 				TypeResolver::NormalizeTypeName(method.name) == methodName) {
@@ -8401,6 +8516,17 @@ std::int32_t ResolveHandlerMethodId(
 		}
 		uniqueMatch = method.id;
 	}
+	if (preparedHandlers != nullptr) {
+		for (const auto& handler : *preparedHandlers) {
+			if (handler.methodName != methodName) {
+				continue;
+			}
+			if (uniqueMatch != 0 && uniqueMatch != handler.methodId) {
+				return 0;
+			}
+			uniqueMatch = handler.methodId;
+		}
+	}
 	return uniqueMatch;
 }
 
@@ -8408,7 +8534,8 @@ std::vector<std::pair<std::int32_t, std::int32_t>> ReadFormControlEventsFromXml(
 	const SimpleXmlNode& node,
 	const std::string& eventNodeName,
 	const std::int32_t preferredOwnerClassId,
-	const RestoreDocumentModel& model)
+	const RestoreDocumentModel& model,
+	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers)
 {
 	std::vector<std::pair<std::int32_t, std::int32_t>> events;
 	for (const auto& child : node.children) {
@@ -8419,7 +8546,11 @@ std::vector<std::pair<std::int32_t, std::int32_t>> ReadFormControlEventsFromXml(
 		if (eventKey < 0) {
 			continue;
 		}
-		const std::int32_t handlerId = ResolveHandlerMethodId(GetXmlAttribute(child, "处理器"), preferredOwnerClassId, model);
+		const std::int32_t handlerId = ResolveHandlerMethodId(
+			GetXmlAttribute(child, "处理器"),
+			preferredOwnerClassId,
+			model,
+			preparedHandlers);
 		events.emplace_back(eventKey, handlerId);
 	}
 	return events;
@@ -8428,11 +8559,16 @@ std::vector<std::pair<std::int32_t, std::int32_t>> ReadFormControlEventsFromXml(
 std::int32_t ReadFormMenuClickEventFromXml(
 	const SimpleXmlNode& node,
 	const std::int32_t preferredOwnerClassId,
-	const RestoreDocumentModel& model)
+	const RestoreDocumentModel& model,
+	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers)
 {
 	for (const auto& child : node.children) {
 		if (child.name == "菜单.事件") {
-			return ResolveHandlerMethodId(GetXmlAttribute(child, "处理器"), preferredOwnerClassId, model);
+			return ResolveHandlerMethodId(
+				GetXmlAttribute(child, "处理器"),
+				preferredOwnerClassId,
+				model,
+				preparedHandlers);
 		}
 	}
 	return 0;
@@ -8490,6 +8626,7 @@ void BuildFormControlTree(
 	const std::int32_t parentId,
 	const std::int32_t preferredOwnerClassId,
 	const RestoreDocumentModel& model,
+	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers,
 	TypeResolver& resolver,
 	IdAllocator& allocator,
 	std::vector<RestoreFormElement>& outElements,
@@ -8512,7 +8649,12 @@ void BuildFormControlTree(
 	element.tabStop = GetXmlBoolAttribute(node, "可停留焦点", true);
 	element.tabIndex = GetXmlIntAttribute(node, "停留顺序", 0);
 	element.extensionData = DecodeBase64(GetXmlAttribute(node, "扩展属性数据"));
-	element.events = ReadFormControlEventsFromXml(node, node.name + ".事件", preferredOwnerClassId, model);
+	element.events = ReadFormControlEventsFromXml(
+		node,
+		node.name + ".事件",
+		preferredOwnerClassId,
+		model,
+		preparedHandlers);
 
 	std::vector<std::int32_t> childIds;
 	const bool isTabControl = resolver.IsTabControlType(element.dataType);
@@ -8530,7 +8672,16 @@ void BuildFormControlTree(
 				if (StartsWith(tabChild.name, node.name + ".")) {
 					continue;
 				}
-				BuildFormControlTree(tabChild, element.id, preferredOwnerClassId, model, resolver, allocator, outElements, childIds);
+				BuildFormControlTree(
+					tabChild,
+					element.id,
+					preferredOwnerClassId,
+					model,
+					preparedHandlers,
+					resolver,
+					allocator,
+					outElements,
+					childIds);
 			}
 		}
 	}
@@ -8539,7 +8690,16 @@ void BuildFormControlTree(
 			if (StartsWith(child.name, node.name + ".")) {
 				continue;
 			}
-			BuildFormControlTree(child, element.id, preferredOwnerClassId, model, resolver, allocator, outElements, childIds);
+			BuildFormControlTree(
+				child,
+				element.id,
+				preferredOwnerClassId,
+				model,
+				preparedHandlers,
+				resolver,
+				allocator,
+				outElements,
+				childIds);
 		}
 	}
 	element.children = std::move(childIds);
@@ -8552,6 +8712,7 @@ void BuildFormMenus(
 	const int level,
 	const std::int32_t preferredOwnerClassId,
 	const RestoreDocumentModel& model,
+	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers,
 	IdAllocator& allocator,
 	std::vector<RestoreFormElement>& outElements)
 {
@@ -8570,9 +8731,20 @@ void BuildFormMenus(
 		element.selected = GetXmlBoolAttribute(child, "选中", false);
 		element.hotKey = GetXmlIntAttribute(child, "快捷键", 0);
 		element.level = level;
-		element.clickEvent = ReadFormMenuClickEventFromXml(child, preferredOwnerClassId, model);
+		element.clickEvent = ReadFormMenuClickEventFromXml(
+			child,
+			preferredOwnerClassId,
+			model,
+			preparedHandlers);
 		outElements.push_back(std::move(element));
-		BuildFormMenus(child, level + 1, preferredOwnerClassId, model, allocator, outElements);
+		BuildFormMenus(
+			child,
+			level + 1,
+			preferredOwnerClassId,
+			model,
+			preparedHandlers,
+			allocator,
+			outElements);
 	}
 }
 
@@ -8581,6 +8753,7 @@ bool BuildFormsFromXml(
 	const std::unordered_map<std::string, std::int32_t>& formClassIds,
 	const std::unordered_map<std::string, std::int32_t>& preferredFormIds,
 	const RestoreDocumentModel& model,
+	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers,
 	TypeResolver& resolver,
 	IdAllocator& allocator,
 	std::vector<RestoreForm>& outForms,
@@ -8645,12 +8818,24 @@ bool BuildFormsFromXml(
 			selfElement.tabStop = GetXmlBoolAttribute(root, "可停留焦点", true);
 			selfElement.tabIndex = GetXmlIntAttribute(root, "停留顺序", 0);
 			selfElement.extensionData = DecodeBase64(GetXmlAttribute(root, "扩展属性数据"));
-			selfElement.events = ReadFormControlEventsFromXml(root, "窗口.事件", form.classId, model);
+			selfElement.events = ReadFormControlEventsFromXml(
+				root,
+				"窗口.事件",
+				form.classId,
+				model,
+				preparedHandlers);
 
 			form.elements.push_back(selfElement);
 			for (const auto& child : root.children) {
 				if (child.name == "窗口.菜单") {
-					BuildFormMenus(child, 0, form.classId, model, allocator, form.elements);
+					BuildFormMenus(
+						child,
+						0,
+						form.classId,
+						model,
+						preparedHandlers,
+						allocator,
+						form.elements);
 				}
 			}
 			std::vector<std::int32_t> rootChildren;
@@ -8658,7 +8843,16 @@ bool BuildFormsFromXml(
 				if (child.name == "窗口.菜单" || StartsWith(child.name, root.name + ".")) {
 					continue;
 				}
-				BuildFormControlTree(child, 0, form.classId, model, resolver, allocator, form.elements, rootChildren);
+				BuildFormControlTree(
+					child,
+					0,
+					form.classId,
+					model,
+					preparedHandlers,
+					resolver,
+					allocator,
+					form.elements,
+					rootChildren);
 			}
 		}
 		else {
@@ -9411,6 +9605,9 @@ bool BuildRestoreModel(
 	std::vector<size_t> localConstantModelIndices;
 	localConstantModelIndices.reserve(parsedConstants.size());
 	std::vector<std::int32_t> localConstantIds(parsedConstants.size(), 0);
+	std::vector<std::int32_t> resourceConstantIds(
+		bundle == nullptr ? 0 : bundle->resources.size(),
+		0);
 	std::vector<std::string> localConstantKeys;
 	localConstantKeys.reserve(parsedConstants.size());
 	std::unordered_map<std::string, int> localConstantKeyCounters;
@@ -10480,6 +10677,19 @@ bool BuildRestoreModel(
 				? reusableConstantSnapshot->id
 				: allocator.Alloc(epl_system_id::kTypeConstant);
 	}
+	if (bundle != nullptr) {
+		for (size_t resourceIndex = 0; resourceIndex < bundle->resources.size(); ++resourceIndex) {
+			const auto& resource = bundle->resources[resourceIndex];
+			const BundleNativeConstantSnapshot* reusableResourceSnapshot =
+				findReusableResourceSnapshot(resource);
+			resourceConstantIds[resourceIndex] =
+				reusableResourceSnapshot != nullptr && reusableResourceSnapshot->id != 0
+					? reusableResourceSnapshot->id
+					: allocator.Alloc(resource.kind == BundleResourceKind::Image
+						? epl_system_id::kTypeImageResource
+						: epl_system_id::kTypeSoundResource);
+		}
+	}
 
 	// 先为所有本地方法分配稳定 ID，方法体编码才能正确解析前向调用、递归和跨页调用。
 	for (size_t classIndex = 0; classIndex < parsedClasses.size(); ++classIndex) {
@@ -10545,6 +10755,47 @@ bool BuildRestoreModel(
 			}
 			preparedMethods.push_back(prepared);
 		}
+	}
+
+	// Form/control ids must exist before method bodies are encoded. This mirrors IDE paste:
+	// names are linked against the actual form objects and public support-library properties.
+	std::vector<PreparedFormHandlerSymbol> preparedFormHandlers;
+	for (size_t classIndex = 0; classIndex < parsedClasses.size(); ++classIndex) {
+		const auto& parsedClass = parsedClasses[classIndex];
+		const std::int32_t ownerClassId = model.classes[localClassModelIndices[classIndex]].id;
+		for (size_t methodIndex = 0;
+			methodIndex < parsedClass.methods.size() &&
+			methodIndex < preparedLocalMethods[classIndex].size();
+			++methodIndex) {
+			preparedFormHandlers.push_back(PreparedFormHandlerSymbol{
+				ownerClassId,
+				TypeResolver::NormalizeTypeName(parsedClass.methods[methodIndex].name),
+				preparedLocalMethods[classIndex][methodIndex].id });
+		}
+	}
+
+	std::unordered_map<std::string, std::int32_t> formClassIds;
+	std::unordered_map<std::string, std::int32_t> preferredFormIds;
+	for (const auto& [formName, classIndex] : formClassMatches) {
+		if (classIndex < localClassModelIndices.size()) {
+			const auto& matchedClass = model.classes[localClassModelIndices[classIndex]];
+			formClassIds.insert_or_assign(formName, matchedClass.id);
+			if (matchedClass.formId != 0) {
+				preferredFormIds.insert_or_assign(formName, matchedClass.formId);
+			}
+		}
+	}
+	if (!BuildFormsFromXml(
+			parsedForms,
+			formClassIds,
+			preferredFormIds,
+			model,
+			&preparedFormHandlers,
+			resolver,
+			allocator,
+			model.forms,
+			outError)) {
+		return false;
 	}
 
 	for (size_t classIndex = 0; classIndex < parsedClasses.size(); ++classIndex) {
@@ -10751,6 +11002,15 @@ bool BuildRestoreModel(
 			for (size_t constantIndex = 0; constantIndex < parsedConstants.size() && constantIndex < localConstantIds.size(); ++constantIndex) {
 				addNativeConstant(parsedConstants[constantIndex].name, localConstantIds[constantIndex]);
 			}
+			if (bundle != nullptr) {
+				for (size_t resourceIndex = 0;
+					resourceIndex < bundle->resources.size() && resourceIndex < resourceConstantIds.size();
+					++resourceIndex) {
+					addNativeConstant(
+						bundle->resources[resourceIndex].logicalName,
+						resourceConstantIds[resourceIndex]);
+				}
+			}
 			for (size_t paramIndex = 0; paramIndex < parsedMethod.params.size() && paramIndex < method.params.size(); ++paramIndex) {
 				addNativeObjectVariable(parsedMethod.params[paramIndex].name, method.params[paramIndex].id, method.params[paramIndex].dataType);
 			}
@@ -10770,13 +11030,17 @@ bool BuildRestoreModel(
 					snapshot->id,
 					resolveTypeIdWithNativeFallback(globalDefinition.typeName, snapshot->dataType));
 			}
-			for (const auto& [formName, matchedClassIndex] : formClassMatches) {
-				if (matchedClassIndex != classIndex ||
-					nativeSourceSnapshot == nullptr ||
-					nativeSourceSnapshot->formId == 0) {
+			for (const auto& form : model.forms) {
+				if (form.classId != targetClass.id || form.id == 0) {
 					continue;
 				}
-				addNativeObjectVariable(formName, nativeSourceSnapshot->formId, 65537);
+				addNativeObjectVariable(form.name, form.id, form.id);
+				nativeObjectEncodeContext.supportMemberTypeByOwnerType.insert_or_assign(form.id, 65537);
+				for (const auto& element : form.elements) {
+					if (!element.name.empty() && element.id != 0 && element.dataType != 0) {
+						addNativeObjectVariable(element.name, element.id, element.dataType);
+					}
+				}
 			}
 			for (size_t sourceClassIndex = 0; sourceClassIndex < parsedClasses.size(); ++sourceClassIndex) {
 				const BundleNativeSourceFileSnapshot* sourceSnapshot =
@@ -10802,6 +11066,7 @@ bool BuildRestoreModel(
 						continue;
 					}
 					const NativeFunctionSymbol sourceMethodSymbol{ -2, sourceMethodSnapshot.id };
+					nativeObjectEncodeContext.localFunctionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
 					nativeObjectEncodeContext.functionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
 					nativeObjectEncodeContext
 						.methodsByOwnerType[sourceSnapshot->classId]
@@ -10837,6 +11102,7 @@ bool BuildRestoreModel(
 						continue;
 					}
 					const NativeFunctionSymbol sourceMethodSymbol{ -2, sourceMethodId };
+					nativeObjectEncodeContext.localFunctionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
 					nativeObjectEncodeContext.functionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
 					nativeObjectEncodeContext
 						.methodsByOwnerType[sourceOwnerTypeId]
@@ -11022,21 +11288,6 @@ bool BuildRestoreModel(
 		model.constants.push_back(std::move(constant));
 	}
 
-	std::unordered_map<std::string, std::int32_t> formClassIds;
-	std::unordered_map<std::string, std::int32_t> preferredFormIds;
-	for (const auto& [formName, classIndex] : formClassMatches) {
-		if (classIndex < localClassModelIndices.size()) {
-			const auto& matchedClass = model.classes[localClassModelIndices[classIndex]];
-			formClassIds.insert_or_assign(formName, matchedClass.id);
-			if (matchedClass.formId != 0) {
-				preferredFormIds.insert_or_assign(formName, matchedClass.formId);
-			}
-		}
-	}
-	if (!BuildFormsFromXml(parsedForms, formClassIds, preferredFormIds, model, resolver, allocator, model.forms, outError)) {
-		return false;
-	}
-
 	for (auto& item : model.classes) {
 		if (!item.isFormClass) {
 			continue;
@@ -11053,15 +11304,15 @@ bool BuildRestoreModel(
 		const size_t baseConstantCount = model.constants.size();
 		std::vector<size_t> resourceModelIndices;
 		resourceModelIndices.reserve(bundle->resources.size());
-		for (const auto& resource : bundle->resources) {
+		for (size_t resourceIndex = 0; resourceIndex < bundle->resources.size(); ++resourceIndex) {
+			const auto& resource = bundle->resources[resourceIndex];
 			RestoreConstant constant;
-			const BundleNativeConstantSnapshot* reusableResourceSnapshot = findReusableResourceSnapshot(resource);
 			constant.id =
-				reusableResourceSnapshot != nullptr && reusableResourceSnapshot->id != 0
-				? reusableResourceSnapshot->id
-				: allocator.Alloc(resource.kind == BundleResourceKind::Image
-					? epl_system_id::kTypeImageResource
-					: epl_system_id::kTypeSoundResource);
+				resourceIndex < resourceConstantIds.size() && resourceConstantIds[resourceIndex] != 0
+					? resourceConstantIds[resourceIndex]
+					: allocator.Alloc(resource.kind == BundleResourceKind::Image
+						? epl_system_id::kTypeImageResource
+						: epl_system_id::kTypeSoundResource);
 			constant.attr = resource.isPublic ? kConstAttrPublic : 0;
 			constant.pageType = resource.kind == BundleResourceKind::Image ? kConstPageImage : kConstPageSound;
 			constant.name = resource.logicalName;
@@ -12986,19 +13237,12 @@ bool RestoreBundleToBytesInternal(
 		return true;
 	}
 
-	const SourcePreflightReport preflightReport = ValidateProjectBundleSource(bundle);
-	if (!preflightReport.IsValid()) {
+	const SourceArrayFormatReport arrayReport = ValidateProjectBundleArrayFormat(bundle);
+	if (!arrayReport.IsValid()) {
 		if (outError != nullptr) {
-			*outError = "source_preflight_failed: " + FormatSourcePreflightReport(preflightReport);
+			*outError = FormatSourceArrayFormatReport(arrayReport);
 		}
 		return false;
-	}
-	for (const SourcePreflightDiagnostic& warning : preflightReport.warnings) {
-		AddRuntimeWarning(
-			"source_preflight_warning: file=" + warning.filePath +
-			", line=" + std::to_string(warning.line) +
-			", code=" + warning.code +
-			", detail=" + warning.message);
 	}
 
 	Document document;

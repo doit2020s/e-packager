@@ -29,6 +29,7 @@
 
 #include "BundlePathUtils.h"
 #include "PathHelper.h"
+#include "SupportLibraryPublicInfo.h"
 
 namespace e2txt {
 
@@ -3685,6 +3686,10 @@ private:
 		symbols.attempted = true;
 		symbols.fileName = GetFirstSupportLibraryToken(m_program.header.supportLibraryInfo[static_cast<size_t>(supportIndex - 1)]);
 		if (symbols.fileName.empty()) {
+			m_supportCache.emplace(supportIndex, std::move(symbols));
+			return false;
+		}
+		if (support_library_public_info::IsUnsafeForStandaloneLoad(symbols.fileName)) {
 			m_supportCache.emplace(supportIndex, std::move(symbols));
 			return false;
 		}

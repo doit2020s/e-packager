@@ -1,0 +1,3 @@
+﻿#include "resource.h"
+
+IDR_RSC_PROJECT_DLL RCDATA "..\\res\\RSCProject.dll"

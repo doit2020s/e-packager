@@ -1502,6 +1502,20 @@ bool IsEquivalentDependency(const e2txt::Dependency& left, const e2txt::Dependen
 
 }  // namespace
 
+bool IsUnsafeForStandaloneLoad(const std::string& libraryFileName)
+{
+	std::string normalized = ToLowerAsciiCopy(TrimAsciiCopy(libraryFileName));
+	const size_t separator = normalized.find_last_of("\\/");
+	if (separator != std::string::npos) {
+		normalized.erase(0, separator + 1);
+	}
+	const size_t extension = normalized.find_last_of('.');
+	if (extension != std::string::npos) {
+		normalized.erase(extension);
+	}
+	return normalized == "rscproject";
+}
+
 bool DumpSupportLibraryPublicInfoToFile(
 	const std::filesystem::path& inputPath,
 	const std::filesystem::path& outputPath,
@@ -1564,6 +1578,10 @@ ExportResult ExportDependencies(
 	for (size_t dependencyIndex = 0; dependencyIndex < dependencies.size(); ++dependencyIndex) {
 		const auto& dependency = dependencies[dependencyIndex];
 		if (dependency.kind != e2txt::DependencyKind::ELib) {
+			continue;
+		}
+		if (IsUnsafeForStandaloneLoad(dependency.fileName.empty() ? dependency.name : dependency.fileName)) {
+			e2txt::AddRuntimeWarning(Utf8Literal(u8"RSCProject 是 e-packager 内置运行时，已跳过支持库公开信息导出。"));
 			continue;
 		}
 

@@ -16,6 +16,7 @@
 
 #include "..\thirdparty\json.hpp"
 #include "PathHelper.h"
+#include "resource.h"
 
 #pragma comment(lib, "Advapi32.lib")
 
@@ -390,17 +391,7 @@ std::string BuildAgentsMarkdown(
 		L"\r\n"
 		L"优先使用 `AutoLinkerTest headless-compile` 处理启动早期弹窗；仅在需要时再用直接参数方式。\r\n"
 		L"\r\n"
-		L"也可以由封包器在提交目标文件前自动执行同一检查：\r\n"
-		L"\r\n"
-		L"```powershell\r\n"
-		L"tool\\e-packager.exe pack . .\\pack\\checked.e `\r\n"
-		L"  --compile-check `\r\n"
-		L"  --eide \"<易语言主程序路径>\" `\r\n"
-		L"  --autolinker-test \"D:\\git\\AutoLinker\\bin\\fne_release\\AutoLinkerTest.exe\" `\r\n"
-		L"  --compile-static --compile-timeout 120\r\n"
-		L"```\r\n"
-		L"\r\n"
-		L"`--eide` 省略时会尝试从 `E.Document` 注册表打开命令中发现主程序；`--autolinker-test` 省略时会尝试环境变量 `E_PACKAGER_AUTOLINKER_TEST`、程序同目录和 `PATH`。也可以用 `E_PACKAGER_EIDE` 提供 IDE 路径。编译失败不会覆盖已有封包输出。\r\n"
+		L"e-packager 不内置 IDE 编译检查；需要 IDE 级别结论时，通过 AutoLinker 的实例绑定、编译和诊断工具完成。\r\n"
 		L"\r\n";
 	std::wstring packOutputFileName = Utf8ToWide(options.defaultPackOutputFileName);
 	if (packOutputFileName.empty()) {
@@ -569,14 +560,18 @@ std::string BuildAgentsMarkdown(
 		<< L"- 类中无法定义单例模式（Singleton）。如果需要一个全局唯一的类实例作为服务使用，必须在 `src/.全局变量.txt` 中声明一个该类类型的全局变量，然后在代码中通过该全局变量访问。\r\n"
 		<< L"- 注意：易语言无法在语言层面阻止同一个类被多次实例化；即使你打算将某个类当作单例使用，也无法保证它不会在其它地方被额外创建。需要开发者自行在代码逻辑上保证只通过全局变量访问该实例。\r\n"
 		<< L"\r\n"
-		<< L"## 回包前预检\r\n"
+		<< L"## 回包前数组检查\r\n"
 		<< L"\r\n"
-		<< L"- 修改源码后先运行 `tool\\\\e-packager.exe validate .`。`pack` 和无参默认回包也会自动执行同一套预检，存在确定性错误时不会写出目标文件。\r\n"
-		<< L"- 预检会阻止声明槽位或属性错位、非法数组维数、自定义类型数组成员零维、声明顺序错误、重复名称、未知点指令、流程结束标记不匹配、智能引号或括号未闭合、`a ＝` 缺少值、半角 `a = value`、只读目标赋值、窗体 XML 或窗口程序集绑定错误、控件成员或事件处理器缺失，以及可静态确定的符号、成员、调用签名、返回值和表达式类型错误。\r\n"
-		<< L"- 只有行尾未使用的声明槽位可以省略；为了填写后面的属性、数组维数或说明而保留的中间空槽仍必须写逗号。`validate` 不会要求声明补齐全部尾槽。\r\n"
-		<< L"- 预检采用保守语义：类继承和访问权限、类实例方法调用边界、支持库或易模块重载及特殊命令、变体型及泛型类型流、窗口事件参数签名、全部隐式转换和特殊表达式尚未完整覆盖；依赖元数据缺失或语义无法确定时不会臆测报错。DLL 入口和运行期错误也不在检查范围内。因此 `errors=0` 只表示没有发现当前覆盖范围内的确定性错误，不等于 IDE 编译成功。\r\n"
-		<< L"- 新增或修改的可执行语句必须能够生成原生语义表达式，否则回包会失败，不会降级写入未检查的原始代码；未修改语句仍复用原生快照。\r\n"
-		<< L"- 需要 IDE 级别结论时，可在封包命令追加 `--compile-check --eide <e.exe> --autolinker-test <AutoLinkerTest.exe>`；编译失败不会覆盖已有目标文件。也可以使用 `compile-check <input.e>` 直接检查已有文件。\r\n"
+		<< L"- 修改源码后先运行 `tool\\\\e-packager.exe validate .`。`pack` 和无参默认回包也会自动执行同一检查。\r\n"
+		<< L"- 静态检查只检查变量声明第三字段误写 `数组`、数组维度字段格式和子程序数组返回声明；参数第三字段中的 `参考 数组` 合法。\r\n"
+		<< L"- 非数组语法、类型、名称连接、窗口绑定和运行期问题不由 `validate` 拦截。无法编码成真实易语言结构时保留回包错误，IDE 级别结论交给 AutoLinker。\r\n"
+		<< L"\r\n"
+		<< L"## 支持库命令与 RSCProject\r\n"
+		<< L"\r\n"
+		<< L"- 完整解包必须从封包器内置资源释放 `tool\\\\RSCProject.dll`；不要在工程根目录或封包器旁放第二份 DLL，也不要把它当成工程的 `RSCProject.fne`。\r\n"
+		<< L"- 独立封包进程不加载 `RSCProject.fne`。公开名不可用时，必须原样保留 `_Lib<序号>Cmd<编号>` 与 `_Lib<序号>Const<编号>`。\r\n"
+		<< L"- 新写裸函数名按当前工程本地子程序、支持库命令、导入易模块子程序的顺序绑定，避免导入模块同名方法抢占系统支持库命令。\r\n"
+		<< L"- 先经记事本再粘贴能正常，只说明 IDE 重新完成了名称连接；这可以辅助定位，不能代替回包、重新解包和命令编号验证。\r\n"
 		<< L"\r\n"
 		<< autoLinkerSection
 		<< L"## 代码格式要求\r\n"
@@ -649,11 +644,10 @@ std::string BuildAgentsMarkdown(
 		<< L"\r\n"
 		<< L"## 错误定位\r\n"
 		<< L"\r\n"
-		<< L"如果回包时检测到语法错误，`e-packager.exe` 会输出类似以下信息：\r\n"
+		<< L"如果数组格式检查失败，`e-packager.exe` 会输出类似以下信息：\r\n"
 		<< L"\r\n"
-		<< L"- `source_preflight_error: file=src/某页面.txt, line=行号, code=assignment_empty_side, ...`\r\n"
-		<< L"- `source_syntax_error: file=src/某页面.txt, line=行号, ...`\r\n"
-		<< L"- `xml_syntax_error: file=src/某窗口.xml, line=行号, ...`\r\n"
+		<< L"- `source_array_format_error: count=...`\r\n"
+		<< L"- `rule=bad_array_variable_declaration`、`bad_array_dimension_field` 或 `bad_array_return_declaration`\r\n"
 		<< L"\r\n"
 		<< L"请按报错中的文件与行号修正后再重新回包。\r\n"
 		<< L"\r\n"
@@ -769,6 +763,54 @@ bool CopyExecutableToToolDirectory(const std::filesystem::path& outputDir, std::
 	return true;
 }
 
+bool WriteEmbeddedRuntimeToToolDirectory(const std::filesystem::path& outputDir, std::string& outError)
+{
+	const HRSRC resource = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_RSC_PROJECT_DLL), MAKEINTRESOURCEW(10));
+	if (resource == nullptr) {
+		outError = "embedded_rsc_project_resource_missing";
+		return false;
+	}
+	const DWORD resourceSize = SizeofResource(nullptr, resource);
+	const HGLOBAL loadedResource = LoadResource(nullptr, resource);
+	const void* resourceBytes = loadedResource == nullptr ? nullptr : LockResource(loadedResource);
+	if (resourceSize == 0 || resourceBytes == nullptr) {
+		outError = "embedded_rsc_project_resource_invalid";
+		return false;
+	}
+
+	const std::filesystem::path toolDir = outputDir / "tool";
+	std::error_code ec;
+	std::filesystem::create_directories(toolDir, ec);
+	if (ec) {
+		outError = "create_tool_dir_failed: " + PathToUtf8(toolDir);
+		return false;
+	}
+
+	const std::filesystem::path destination = toolDir / "RSCProject.dll";
+	const std::filesystem::path staged = toolDir / "RSCProject.dll.tmp";
+	{
+		std::ofstream output(staged, std::ios::binary | std::ios::trunc);
+		if (!output.is_open()) {
+			outError = "open_embedded_rsc_project_failed: " + PathToUtf8(staged);
+			return false;
+		}
+		output.write(static_cast<const char*>(resourceBytes), static_cast<std::streamsize>(resourceSize));
+		if (!output.good()) {
+			output.close();
+			std::filesystem::remove(staged, ec);
+			outError = "write_embedded_rsc_project_failed: " + PathToUtf8(staged);
+			return false;
+		}
+	}
+
+	if (!MoveFileExW(staged.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+		std::filesystem::remove(staged, ec);
+		outError = "publish_embedded_rsc_project_failed: " + PathToUtf8(destination);
+		return false;
+	}
+	return true;
+}
+
 }  // namespace
 
 static constexpr int kSupportedInfoVersion = 1;
@@ -792,6 +834,9 @@ bool WriteWorkspaceFiles(
 	}
 
 	if (!CopyExecutableToToolDirectory(outputDir, outError)) {
+		return false;
+	}
+	if (!WriteEmbeddedRuntimeToToolDirectory(outputDir, outError)) {
 		return false;
 	}
 
