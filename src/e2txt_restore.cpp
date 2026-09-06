@@ -9028,6 +9028,35 @@ Document BuildDocumentFromBundle(const ProjectBundle& bundle)
 
 bool HasPersistedEComPathOverride(const ProjectBundle& bundle);
 
+bool ContainsRawSupportLibraryObjectCall(const std::string_view text)
+{
+	size_t searchFrom = 0;
+	while (searchFrom < text.size()) {
+		const size_t memberPos = text.find("._Lib", searchFrom);
+		if (memberPos == std::string_view::npos) {
+			return false;
+		}
+		const size_t commandPos = text.find("Cmd", memberPos + 5);
+		if (commandPos != std::string_view::npos &&
+			commandPos + 3 < text.size() &&
+			std::isdigit(static_cast<unsigned char>(text[commandPos + 3])) != 0) {
+			return true;
+		}
+		searchFrom = memberPos + 5;
+	}
+	return false;
+}
+
+bool HasRawSupportLibraryObjectCall(const ParsedMethodDef& method)
+{
+	for (const auto& line : method.bodyLines) {
+		if (ContainsRawSupportLibraryObjectCall(line)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool CanReuseNativeBytesForSemanticEquivalentSources(
 	const ProjectBundle& bundle,
 	const ProjectBundle& originalBundle,
@@ -9074,6 +9103,9 @@ bool CanReuseNativeBytesForSemanticEquivalentSources(
 			return false;
 		}
 		for (size_t methodIndex = 0; methodIndex < parsedClass.methods.size(); ++methodIndex) {
+			if (HasRawSupportLibraryObjectCall(parsedClass.methods[methodIndex])) {
+				return false;
+			}
 			const auto& methodSnapshot = snapshot.methods[methodIndex];
 			if (methodSnapshot.textDigest.empty() ||
 				methodSnapshot.textDigest != ComputeParsedMethodDigest(parsedClass.methods[methodIndex])) {
@@ -9592,6 +9624,7 @@ bool BuildRestoreModel(
 		NativeMethodSnapshotMatch identityMatch;
 		std::int32_t id = 0;
 		std::int32_t memoryAddress = 0;
+		bool rebuildRawSupportObjectCalls = false;
 	};
 	std::vector<std::vector<PreparedLocalMethod>> preparedLocalMethods(parsedClasses.size());
 	std::vector<size_t> localStructModelIndices;
@@ -9611,11 +9644,17 @@ bool BuildRestoreModel(
 	std::vector<std::string> localConstantKeys;
 	localConstantKeys.reserve(parsedConstants.size());
 	std::unordered_map<std::string, int> localConstantKeyCounters;
-	const auto appendDefinedIdRange = [](RestoreDependencyInfo& dependency, const std::int32_t start, const std::int32_t count) {
-		if (count <= 0) {
-			return;
+	const auto appendDefinedIdRanges = [](RestoreDependencyInfo& dependency, std::vector<std::int32_t> ids) {
+		ids.erase(std::remove(ids.begin(), ids.end(), 0), ids.end());
+		if (!ids.empty()) {
+			// The native EC dependency record stores one start/count slot per
+			// imported symbol category. Splitting a category into arbitrary ranges
+			// changes the record shape and can crash the E 5.9 IDE while loading it.
+			dependency.definedIds.push_back(RestoreDependencyInfo::DefinedIdRange {
+				ids.front(),
+				static_cast<std::int32_t>(ids.size()),
+			});
 		}
-		dependency.definedIds.push_back(RestoreDependencyInfo::DefinedIdRange { start, count });
 	};
 
 	auto importDependencyBundle = [&](RestoreDependencyInfo& dependency) -> bool {
@@ -10020,8 +10059,7 @@ bool BuildRestoreModel(
 		};
 		std::vector<ImportedDependencyStructBinding> importedDependencyStructBindings;
 		importedDependencyStructBindings.reserve(importedDependencyStructIndices.size());
-		std::int32_t rangeStart = 0;
-		std::int32_t rangeCount = 0;
+		std::vector<std::int32_t> definedIdsForSection;
 		for (const size_t parsedStructIndex : importedDependencyStructIndices) {
 			const auto& parsedStruct = dependencyStructs[parsedStructIndex];
 			const auto* importedStructSymbol = parsedStructIndex < dependencyImportedStructSymbolsByIndex.size()
@@ -10078,20 +10116,16 @@ bool BuildRestoreModel(
 				importedStructSymbol,
 				nativeSnapshot,
 			});
-			if (rangeStart == 0) {
-				rangeStart = model.structs[modelStructIndex].id;
-			}
-			++rangeCount;
+			definedIdsForSection.push_back(model.structs[modelStructIndex].id);
 		}
 		if (!preserveDefinedIds) {
-			appendDefinedIdRange(dependency, rangeStart, rangeCount);
+			appendDefinedIdRanges(dependency, definedIdsForSection);
 		}
 
 		std::unordered_map<std::string, size_t> importedClassModelIndices;
 		std::vector<std::pair<std::string, size_t>> importedClassModelOrder;
 		size_t hiddenTempClassIndex = (std::numeric_limits<size_t>::max)();
-		rangeStart = 0;
-		rangeCount = 0;
+		definedIdsForSection.clear();
 		{
 			RestoreClass hiddenTemp;
 			const auto hiddenNativeIt = nativeClassBindings.find(TypeResolver::NormalizeTypeName("__HIDDEN_TEMP_MOD__"));
@@ -10110,8 +10144,7 @@ bool BuildRestoreModel(
 			hiddenTemp.isHidden = true;
 			hiddenTempClassIndex = model.classes.size();
 			model.classes.push_back(std::move(hiddenTemp));
-			rangeStart = model.classes.back().id;
-			rangeCount = 1;
+			definedIdsForSection.push_back(model.classes.back().id);
 		}
 		for (const auto& parsedClass : dependencyClasses) {
 			if (!parsedClass.isPublic || parsedClass.isFormClass) {
@@ -10133,10 +10166,10 @@ bool BuildRestoreModel(
 			importedClassModelOrder.emplace_back(normalizedClassName, model.classes.size());
 			model.classes.push_back(std::move(item));
 			resolver.RegisterUserType(parsedClass.name, model.classes.back().id);
-			++rangeCount;
+			definedIdsForSection.push_back(model.classes.back().id);
 		}
 		if (!preserveDefinedIds) {
-			appendDefinedIdRange(dependency, rangeStart, rangeCount);
+			appendDefinedIdRanges(dependency, definedIdsForSection);
 		}
 
 		for (const auto& binding : importedDependencyStructBindings) {
@@ -10167,8 +10200,7 @@ bool BuildRestoreModel(
 			}
 		}
 
-		rangeStart = 0;
-		rangeCount = 0;
+		definedIdsForSection.clear();
 		for (const auto& variable : dependencyGlobals) {
 			if (!HasWordFlag(variable.flagsText, "公开")) {
 				continue;
@@ -10176,18 +10208,14 @@ bool BuildRestoreModel(
 			const std::int32_t importedId = dependencyIds.AllocTopLevel(allocator, epl_system_id::kTypeGlobal);
 			RestoreVariable imported = convertVariableWithId(variable, epl_system_id::kTypeGlobal, false, false, importedId);
 			imported.attr |= kGlobalAttrHidden;
-			if (rangeStart == 0) {
-				rangeStart = imported.id;
-			}
-			++rangeCount;
+			definedIdsForSection.push_back(imported.id);
 			model.globals.push_back(std::move(imported));
 		}
 		if (!preserveDefinedIds) {
-			appendDefinedIdRange(dependency, rangeStart, rangeCount);
+			appendDefinedIdRanges(dependency, definedIdsForSection);
 		}
 
-		rangeStart = 0;
-		rangeCount = 0;
+		definedIdsForSection.clear();
 		for (const auto& parsedConstant : dependencyConstants) {
 			if (!parsedConstant.isPublic) {
 				continue;
@@ -10201,10 +10229,7 @@ bool BuildRestoreModel(
 			constant.name = parsedConstant.name;
 			constant.comment = parsedConstant.comment;
 			constant.valueText = parsedConstant.valueText;
-			if (rangeStart == 0) {
-				rangeStart = constant.id;
-			}
-			++rangeCount;
+			definedIdsForSection.push_back(constant.id);
 			model.constants.push_back(std::move(constant));
 		}
 		for (const auto& resource : dependencyBundle.resources) {
@@ -10222,18 +10247,14 @@ bool BuildRestoreModel(
 			constant.name = resource.logicalName;
 			constant.comment = resource.comment;
 			constant.rawData = resource.data;
-			if (rangeStart == 0) {
-				rangeStart = constant.id;
-			}
-			++rangeCount;
+			definedIdsForSection.push_back(constant.id);
 			model.constants.push_back(std::move(constant));
 		}
 		if (!preserveDefinedIds) {
-			appendDefinedIdRange(dependency, rangeStart, rangeCount);
+			appendDefinedIdRanges(dependency, definedIdsForSection);
 		}
 
-		rangeStart = 0;
-		rangeCount = 0;
+		definedIdsForSection.clear();
 		for (const auto& parsedDll : dependencyDlls) {
 			if (!parsedDll.isPublic) {
 				continue;
@@ -10249,18 +10270,14 @@ bool BuildRestoreModel(
 			for (const auto& param : parsedDll.params) {
 				dll.params.push_back(convertDependencyVariable(param, epl_system_id::kTypeDllParameter, false, false));
 			}
-			if (rangeStart == 0) {
-				rangeStart = dll.id;
-			}
-			++rangeCount;
+			definedIdsForSection.push_back(dll.id);
 			model.dlls.push_back(std::move(dll));
 		}
 		if (!preserveDefinedIds) {
-			appendDefinedIdRange(dependency, rangeStart, rangeCount);
+			appendDefinedIdRanges(dependency, definedIdsForSection);
 		}
 
-		rangeStart = 0;
-		rangeCount = 0;
+		definedIdsForSection.clear();
 		const auto appendImportedMethod = [&](
 			const ParsedMethodDef& parsedMethod,
 			RestoreClass& ownerClass,
@@ -10349,10 +10366,7 @@ bool BuildRestoreModel(
 				}
 			}
 			ownerClass.functionIds.push_back(method.id);
-			if (rangeStart == 0) {
-				rangeStart = method.id;
-			}
-			++rangeCount;
+			definedIdsForSection.push_back(method.id);
 			model.methods.push_back(std::move(method));
 		};
 		if (!dependency.nativeMethods.empty()) {
@@ -10514,10 +10528,7 @@ bool BuildRestoreModel(
 				}
 
 				model.classes[ownerIndex].functionIds.push_back(method.id);
-				if (rangeStart == 0) {
-					rangeStart = method.id;
-				}
-				++rangeCount;
+				definedIdsForSection.push_back(method.id);
 				model.methods.push_back(std::move(method));
 			}
 		}
@@ -10574,7 +10585,7 @@ bool BuildRestoreModel(
 			}
 		}
 		if (!preserveDefinedIds) {
-			appendDefinedIdRange(dependency, rangeStart, rangeCount);
+			appendDefinedIdRanges(dependency, definedIdsForSection);
 		}
 		return true;
 	};
@@ -10742,7 +10753,14 @@ bool BuildRestoreModel(
 		preparedMethods.reserve(parsedClass.methods.size());
 		for (const auto& parsedMethod : parsedClass.methods) {
 			PreparedLocalMethod prepared;
-			prepared.reusableMatch = findNativeMethodSnapshot(parsedMethod, true);
+			// Raw support-library object calls can be reconstructed from their stable
+			// library/command ids. Reusing an old expression snapshot here can retain
+			// malformed member-call data that makes the IDE crash while loading the
+			// project, even when the exported method text itself is unchanged.
+			prepared.rebuildRawSupportObjectCalls = HasRawSupportLibraryObjectCall(parsedMethod);
+			prepared.reusableMatch = prepared.rebuildRawSupportObjectCalls
+				? NativeMethodSnapshotMatch{}
+				: findNativeMethodSnapshot(parsedMethod, true);
 			prepared.identityMatch = prepared.reusableMatch.snapshot != nullptr
 				? prepared.reusableMatch
 				: findNativeMethodSnapshot(parsedMethod, false);
@@ -11110,6 +11128,7 @@ bool BuildRestoreModel(
 				}
 			}
 			const bool canReuseIdentityNativeMethodSnapshot =
+				!preparedMethod.rebuildRawSupportObjectCalls &&
 				identityNativeMethodSnapshot != nullptr &&
 				originalParsedMethod != nullptr &&
 				(AreParsedMethodsCodeEquivalent(parsedMethod, *originalParsedMethod) ||
@@ -11118,10 +11137,11 @@ bool BuildRestoreModel(
 			const bool methodTextUnchanged =
 				originalParsedMethod != nullptr &&
 				AreParsedMethodsTextuallyEquivalent(parsedMethod, *originalParsedMethod);
-			if (reusableNativeMethodSnapshot != nullptr ||
+			if (!preparedMethod.rebuildRawSupportObjectCalls &&
+				(reusableNativeMethodSnapshot != nullptr ||
 				(canReuseIdentityNativeMethodSnapshot &&
 					methodTextUnchanged) ||
-				(preferNativeMethodSnapshots && identityNativeMethodSnapshot != nullptr)) {
+				(preferNativeMethodSnapshots && identityNativeMethodSnapshot != nullptr))) {
 				const BundleNativeMethodSnapshot* nativeMethodSnapshot =
 					reusableNativeMethodSnapshot != nullptr ? reusableNativeMethodSnapshot : identityNativeMethodSnapshot;
 				method.lineOffset = nativeMethodSnapshot->lineOffset;
@@ -11431,7 +11451,156 @@ bool CanReuseNativeBundleSnapshot(const ProjectBundle& bundle)
 	if (bundle.nativeSourceBytes.empty() || bundle.nativeBundleDigest.empty()) {
 		return false;
 	}
+	for (const auto& sourceFile : bundle.sourceFiles) {
+		if (ContainsRawSupportLibraryObjectCall(sourceFile.content)) {
+			return false;
+		}
+	}
 	return ComputeBundleDigest(bundle) == bundle.nativeBundleDigest;
+}
+
+bool TryParseRawStructSymbolAt(
+	const std::string_view text,
+	const size_t offset,
+	std::int32_t& outId,
+	bool& outIsMember,
+	size_t& outLength)
+{
+	constexpr std::string_view kStructPrefix = "_Struct_0x";
+	constexpr std::string_view kMemberPrefix = "_StructMem_0x";
+	std::string_view prefix;
+	std::int32_t idType = 0;
+	if (text.substr(offset).starts_with(kMemberPrefix)) {
+		prefix = kMemberPrefix;
+		idType = epl_system_id::kTypeStructMember;
+		outIsMember = true;
+	}
+	else if (text.substr(offset).starts_with(kStructPrefix)) {
+		prefix = kStructPrefix;
+		idType = epl_system_id::kTypeStruct;
+		outIsMember = false;
+	}
+	else {
+		return false;
+	}
+
+	const size_t hexBegin = offset + prefix.size();
+	size_t hexEnd = hexBegin;
+	while (hexEnd < text.size() &&
+		std::isxdigit(static_cast<unsigned char>(text[hexEnd])) != 0) {
+		++hexEnd;
+	}
+	if (hexEnd == hexBegin || hexEnd - hexBegin > 6) {
+		return false;
+	}
+	if (hexEnd < text.size()) {
+		const unsigned char next = static_cast<unsigned char>(text[hexEnd]);
+		if (std::isalnum(next) != 0 || next == '_') {
+			return false;
+		}
+	}
+
+	std::uint32_t suffix = 0;
+	const auto [parseEnd, parseError] = std::from_chars(
+		text.data() + hexBegin,
+		text.data() + hexEnd,
+		suffix,
+		16);
+	if (parseError != std::errc() || parseEnd != text.data() + hexEnd ||
+		suffix > static_cast<std::uint32_t>(epl_system_id::kMaskNum)) {
+		return false;
+	}
+	outId = idType | static_cast<std::int32_t>(suffix);
+	outLength = hexEnd - offset;
+	return true;
+}
+
+bool ValidateRawStructReferencesForRestore(const ProjectBundle& bundle, std::string* outError)
+{
+	std::unordered_set<std::int32_t> knownStructIds;
+	std::unordered_set<std::int32_t> knownMemberIds;
+	for (const auto& snapshot : bundle.nativeStructSnapshots) {
+		if (snapshot.id != 0) {
+			knownStructIds.insert(snapshot.id);
+		}
+		for (const std::int32_t memberId : snapshot.memberIds) {
+			if (memberId != 0) {
+				knownMemberIds.insert(memberId);
+			}
+		}
+	}
+
+	for (const auto& sourceFile : bundle.sourceFiles) {
+		std::string_view remaining = sourceFile.content;
+		size_t line1 = 1;
+		while (true) {
+			const size_t lineEnd = remaining.find('\n');
+			std::string_view line = remaining.substr(0, lineEnd);
+			if (!line.empty() && line.back() == '\r') {
+				line.remove_suffix(1);
+			}
+			const std::string lineText(line);
+
+			bool inChineseQuote = false;
+			bool inAsciiQuote = false;
+			for (size_t offset = 0; offset < line.size();) {
+				size_t quoteLength = 0;
+				if (!inAsciiQuote && TryGetNativeTextQuoteLength(lineText, offset, quoteLength)) {
+					inChineseQuote = !inChineseQuote;
+					offset += quoteLength;
+					continue;
+				}
+				if (!inChineseQuote && line[offset] == '"') {
+					inAsciiQuote = !inAsciiQuote;
+					++offset;
+					continue;
+				}
+				if (inChineseQuote || inAsciiQuote) {
+					++offset;
+					continue;
+				}
+				if (line[offset] == '\'') {
+					break;
+				}
+				if (offset > 0) {
+					const unsigned char previous = static_cast<unsigned char>(line[offset - 1]);
+					if (std::isalnum(previous) != 0 || previous == '_') {
+						++offset;
+						continue;
+					}
+				}
+
+				std::int32_t symbolId = 0;
+				bool isMember = false;
+				size_t symbolLength = 0;
+				if (!TryParseRawStructSymbolAt(line, offset, symbolId, isMember, symbolLength)) {
+					++offset;
+					continue;
+				}
+				const bool known = isMember
+					? knownMemberIds.contains(symbolId)
+					: knownStructIds.contains(symbolId);
+				if (!known) {
+					if (outError != nullptr) {
+						*outError =
+							"unresolved_struct_placeholder: file=" + LocalTextToUtf8(sourceFile.relativePath) +
+							" line=" + std::to_string(line1) +
+							" symbol=" + std::string(line.substr(offset, symbolLength)) +
+							" kind=" + (isMember ? "member" : "struct");
+					}
+					return false;
+				}
+				offset += symbolLength;
+			}
+
+			if (lineEnd == std::string_view::npos) {
+				break;
+			}
+			remaining.remove_prefix(lineEnd + 1);
+			++line1;
+		}
+	}
+	return true;
 }
 
 struct SectionEmitInfo {
@@ -13230,6 +13399,12 @@ bool RestoreBundleToBytesInternal(
 {
 	if (outError != nullptr) {
 		outError->clear();
+	}
+	// Raw project structure ids are only safe when the preserved native symbol
+	// table still owns them. Reject dangling ids before any snapshot fast path can
+	// silently emit a project whose data types or members appear blank in the IDE.
+	if (!ValidateRawStructReferencesForRestore(bundle, outError)) {
+		return false;
 	}
 
 	if (CanReuseNativeBundleSnapshot(bundle)) {
