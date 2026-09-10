@@ -214,10 +214,14 @@ std::vector<std::filesystem::path> BuildLibraryFileVariants(const std::string& l
 
 	if (filePath.has_extension()) {
 		variants.push_back(filePath);
+		if (filePath.extension() == ".fne") {
+			variants.push_back(filePath.string() + ".dll");
+		}
 		return variants;
 	}
 
 	variants.push_back(filePath.string() + ".fne");
+	variants.push_back(filePath.string() + ".fne.dll");
 	variants.push_back(filePath.string() + ".fnr");
 	variants.push_back(filePath.string() + ".dll");
 	variants.push_back(filePath);
@@ -1147,6 +1151,31 @@ void AppendEventDetails(
 	}
 }
 
+bool IsVersion2EventTable(const LIB_DATA_TYPE_INFO& dataType)
+{
+	if (dataType.m_nEventCount <= 0 ||
+		dataType.m_nEventCount > kMaxSupportLibraryArrayCount ||
+		dataType.m_pEventBegin == nullptr ||
+		!IsReadableMemoryRange(dataType.m_pEventBegin, sizeof(EVENT_INFO))) {
+		return false;
+	}
+	const auto* first = reinterpret_cast<const EVENT_INFO*>(dataType.m_pEventBegin);
+	return (first->m_dwState & EV_IS_VER2) != 0;
+}
+
+bool IsReadableEventTable(const LIB_DATA_TYPE_INFO& dataType, const bool version2)
+{
+	if (dataType.m_nEventCount <= 0 ||
+		dataType.m_nEventCount > kMaxSupportLibraryArrayCount ||
+		dataType.m_pEventBegin == nullptr) {
+		return false;
+	}
+	const size_t stride = version2 ? sizeof(EVENT_INFO2) : sizeof(EVENT_INFO);
+	return IsReadableMemoryRange(
+		dataType.m_pEventBegin,
+		stride * static_cast<size_t>(dataType.m_nEventCount));
+}
+
 void AppendDataTypeDetails(
 	std::vector<std::string>& lines,
 	const LIB_DATA_TYPE_INFO& dataType,
@@ -1218,14 +1247,17 @@ void AppendDataTypeDetails(
 		}
 	}
 
-	if (dataType.m_nEventCount > 0 &&
-		dataType.m_nEventCount <= kMaxSupportLibraryArrayCount &&
-		dataType.m_pEventBegin != nullptr &&
-		IsReadableMemoryRange(
-			dataType.m_pEventBegin,
-			sizeof(EVENT_INFO2) * static_cast<size_t>(dataType.m_nEventCount))) {
+	const bool eventTableVersion2 = IsVersion2EventTable(dataType);
+	if (IsReadableEventTable(dataType, eventTableVersion2)) {
+		const size_t eventStride = eventTableVersion2 ? sizeof(EVENT_INFO2) : sizeof(EVENT_INFO);
 		for (int eventIndex = 0; eventIndex < dataType.m_nEventCount; ++eventIndex) {
-			AppendEventDetails(lines, dataType.m_pEventBegin[eventIndex], libInfo, "  ");
+			const auto* address = reinterpret_cast<const std::uint8_t*>(dataType.m_pEventBegin) +
+				eventStride * static_cast<size_t>(eventIndex);
+			AppendEventDetails(
+				lines,
+				*reinterpret_cast<const EVENT_INFO2*>(address),
+				libInfo,
+				"  ");
 		}
 	}
 

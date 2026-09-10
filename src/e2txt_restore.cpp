@@ -234,6 +234,7 @@ struct RestoreDocumentModel {
 	std::string sourcePath;
 	std::string projectName;
 	std::string versionText;
+	ProjectSubsystem projectSubsystem = ProjectSubsystem::Unknown;
 	std::vector<RestoreDependencyInfo> dependencies;
 	std::vector<RestoreClass> classes;
 	std::vector<RestoreMethod> methods;
@@ -4231,10 +4232,17 @@ std::string NormalizeNativeOperatorSyntaxForParsing(const std::string& text)
 		std::string_view target;
 		bool needsWordBoundary = false;
 	};
-	constexpr std::array<OperatorAlias, 12> kAliases = {
+	constexpr std::array<OperatorAlias, 19> kAliases = {
 		OperatorAlias{ "≠", "!=" },
 		{ "≤", "<=" },
 		{ "≥", ">=" },
+		{ "<>", "!=" },
+		{ "％", "%" },
+		{ "!=", "!=" },
+		{ "<=", "<=" },
+		{ ">=", ">=" },
+		{ "==", "==" },
+		{ "=", "==" },
 		{ "＝", "==" },
 		{ "＜", "<" },
 		{ "＞", ">" },
@@ -4479,6 +4487,7 @@ bool SplitNativeObjectCallArguments(const std::string& text, std::vector<std::st
 	}
 	std::string current;
 	int parenDepth = 0;
+	int braceDepth = 0;
 	bool inChineseQuote = false;
 	bool inAsciiQuote = false;
 	for (size_t index = 0; index < text.size(); ++index) {
@@ -4501,7 +4510,13 @@ bool SplitNativeObjectCallArguments(const std::string& text, std::vector<std::st
 			else if (text[index] == ')' && parenDepth > 0) {
 				--parenDepth;
 			}
-			else if (text[index] == ',' && parenDepth == 0) {
+			else if (text[index] == '{') {
+				++braceDepth;
+			}
+			else if (text[index] == '}' && braceDepth > 0) {
+				--braceDepth;
+			}
+			else if (text[index] == ',' && parenDepth == 0 && braceDepth == 0) {
 				outArgs.push_back(TrimAsciiCopy(current));
 				current.clear();
 				continue;
@@ -4510,7 +4525,7 @@ bool SplitNativeObjectCallArguments(const std::string& text, std::vector<std::st
 		current.push_back(text[index]);
 	}
 	outArgs.push_back(TrimAsciiCopy(current));
-	return !inChineseQuote && !inAsciiQuote && parenDepth == 0;
+	return !inChineseQuote && !inAsciiQuote && parenDepth == 0 && braceDepth == 0;
 }
 
 bool ParseNativeObjectCallLine(const std::string& code, ParsedNativeObjectCallLine& outCall)
@@ -4852,13 +4867,14 @@ void WriteNativeCallHeader(
 	ByteWriter& writer,
 	const std::int32_t methodId,
 	const std::int16_t libraryId,
-	const std::int16_t flags)
+	const std::int16_t flags,
+	const std::string& comment = {})
 {
 	writer.WriteI32(methodId);
 	writer.WriteI16(libraryId);
 	writer.WriteI16(flags);
 	writer.WriteBStr(std::nullopt);
-	writer.WriteBStr(std::nullopt);
+	writer.WriteBStr(comment.empty() ? std::nullopt : std::make_optional(comment));
 }
 
 std::string StripOuterParentheses(std::string expression)
@@ -5516,7 +5532,7 @@ bool TryEncodeNativeObjectMethodCallLine(
 
 	ByteWriter writer;
 	writer.WriteU8(0x6A);
-	WriteNativeCallHeader(writer, methodSymbol.methodId, methodSymbol.libraryId, static_cast<std::int16_t>(statement.mask ? 0x20 : 0));
+	WriteNativeCallHeader(writer, methodSymbol.methodId, methodSymbol.libraryId, static_cast<std::int16_t>(statement.mask ? 0x20 : 0), statement.fixedComment);
 	if (methodSymbol.libraryId == -2 || methodSymbol.libraryId == -3) {
 		outExpression.methodReferences.push_back(0);
 	}
@@ -5587,7 +5603,7 @@ bool TryEncodeNativeFunctionCallStatementLine(
 		outExpression.methodReferences.push_back(callOffset);
 	}
 	writer.WriteU8(0x6A);
-	WriteNativeCallHeader(writer, functionSymbol.methodId, functionSymbol.libraryId, static_cast<std::int16_t>(statement.mask ? 0x20 : 0));
+	WriteNativeCallHeader(writer, functionSymbol.methodId, functionSymbol.libraryId, static_cast<std::int16_t>(statement.mask ? 0x20 : 0), statement.fixedComment);
 	writer.WriteU8(0x36);
 	const bool needsDefaultReturnValue =
 		functionSymbol.libraryId == 0 &&
@@ -5644,7 +5660,7 @@ bool TryEncodeNativeAssignmentLine(
 
 	ByteWriter writer;
 	writer.WriteU8(0x6A);
-	WriteNativeCallHeader(writer, 52, 0, static_cast<std::int16_t>(statement.mask ? 0x20 : 0));
+	WriteNativeCallHeader(writer, 52, 0, static_cast<std::int16_t>(statement.mask ? 0x20 : 0), statement.fixedComment);
 	writer.WriteU8(0x36);
 	std::string expressionError;
 	if (!TryEncodeNativeExpression(leftExpression, context, writer, outExpression.methodReferences, outExpression.variableReferences, outExpression.constantReferences, &expressionError)) {
@@ -5666,11 +5682,37 @@ bool TryEncodeNativeAssignmentLine(
 }
 
 bool TryEncodeNativeRawStatementLine(
-	const BodyStatement& statement,
+	const BodyStatement& sourceStatement,
 	const NativeObjectMethodEncodeContext& context,
 	EncodedNativeExpression& outExpression,
 	std::string* outError = nullptr)
 {
+	// Split a trailing E-language comment only for semantic encoding. Snapshot
+	// comparison still receives the original source line.
+	BodyStatement statement = sourceStatement;
+	bool inChineseQuote = false;
+	bool inAsciiQuote = false;
+	for (size_t index = 0; index < statement.code.size(); ++index) {
+		size_t quoteLength = 0;
+		if (!inAsciiQuote && TryGetNativeTextQuoteLength(statement.code, index, quoteLength)) {
+			inChineseQuote = !inChineseQuote;
+			index += quoteLength - 1;
+			continue;
+		}
+		if (!inChineseQuote && statement.code[index] == '"') {
+			inAsciiQuote = !inAsciiQuote;
+			continue;
+		}
+		if (!inChineseQuote && !inAsciiQuote && statement.code[index] == '\'') {
+			statement.fixedComment = statement.code.substr(index + 1);
+			if (!statement.fixedComment.empty() && statement.fixedComment.front() == ' ') {
+				statement.fixedComment.erase(0, 1);
+			}
+			statement.code = TrimRightAsciiCopy(statement.code.substr(0, index));
+			break;
+		}
+	}
+
 	std::string lastError;
 	std::string objectCallError;
 	std::string assignmentError;
@@ -8280,6 +8322,7 @@ void ParseStructPage(const Page& page, std::vector<ParsedStructDef>& outStructs)
 {
 	std::vector<std::string> fields;
 	ParsedStructDef* current = nullptr;
+	ParsedVariableDef* currentMember = nullptr;
 	for (const auto& line : page.lines) {
 		const std::string trimmed = TrimAsciiCopy(line);
 		if (StartsWith(trimmed, ".数据类型")) {
@@ -8290,6 +8333,7 @@ void ParseStructPage(const Page& page, std::vector<ParsedStructDef>& outStructs)
 			item.comment = ExtractRemainingDefinitionFieldText(trimmed, "数据类型", 2);
 			outStructs.push_back(std::move(item));
 			current = &outStructs.back();
+			currentMember = nullptr;
 			continue;
 		}
 		if (current != nullptr && StartsWith(trimmed, ".成员")) {
@@ -8301,6 +8345,15 @@ void ParseStructPage(const Page& page, std::vector<ParsedStructDef>& outStructs)
 			member.arrayText = GetFieldOrEmpty(fields, 3);
 			member.comment = ExtractRemainingDefinitionFieldText(trimmed, "成员", 4);
 			current->members.push_back(std::move(member));
+			currentMember = &current->members.back();
+			continue;
+		}
+		if (!trimmed.empty() && current != nullptr && trimmed.front() != '.') {
+			std::string& comment = currentMember != nullptr ? currentMember->comment : current->comment;
+			if (!comment.empty()) {
+				comment += "\r\n";
+			}
+			comment += trimmed;
 		}
 	}
 }
@@ -8309,6 +8362,7 @@ void ParseDllPage(const Page& page, std::vector<ParsedDllDef>& outDlls)
 {
 	std::vector<std::string> fields;
 	ParsedDllDef* current = nullptr;
+	ParsedVariableDef* currentParam = nullptr;
 	for (const auto& line : page.lines) {
 		const std::string trimmed = TrimAsciiCopy(line);
 		if (StartsWith(trimmed, ".DLL命令")) {
@@ -8322,6 +8376,7 @@ void ParseDllPage(const Page& page, std::vector<ParsedDllDef>& outDlls)
 			dll.comment = ExtractRemainingDefinitionFieldText(trimmed, "DLL命令", 5);
 			outDlls.push_back(std::move(dll));
 			current = &outDlls.back();
+			currentParam = nullptr;
 			continue;
 		}
 		if (current != nullptr && StartsWith(trimmed, ".参数")) {
@@ -8332,6 +8387,15 @@ void ParseDllPage(const Page& page, std::vector<ParsedDllDef>& outDlls)
 			param.flagsText = GetFieldOrEmpty(fields, 2);
 			param.comment = ExtractRemainingDefinitionFieldText(trimmed, "参数", 3);
 			current->params.push_back(std::move(param));
+			currentParam = &current->params.back();
+			continue;
+		}
+		if (!trimmed.empty() && current != nullptr && trimmed.front() != '.') {
+			std::string& comment = currentParam != nullptr ? currentParam->comment : current->comment;
+			if (!comment.empty()) {
+				comment += "\r\n";
+			}
+			comment += trimmed;
 		}
 	}
 }
@@ -8647,6 +8711,7 @@ void BuildFormControlTree(
 	element.visible = GetXmlBoolAttribute(node, "可视", true);
 	element.cursor = DecodeBase64(GetXmlAttribute(node, "鼠标指针"));
 	element.tabStop = GetXmlBoolAttribute(node, "可停留焦点", true);
+	element.locked = GetXmlBoolAttribute(node, "锁定", false);
 	element.tabIndex = GetXmlIntAttribute(node, "停留顺序", 0);
 	element.extensionData = DecodeBase64(GetXmlAttribute(node, "扩展属性数据"));
 	element.events = ReadFormControlEventsFromXml(
@@ -8816,6 +8881,7 @@ bool BuildFormsFromXml(
 			selfElement.visible = GetXmlBoolAttribute(root, "可视", true);
 			selfElement.cursor = DecodeBase64(GetXmlAttribute(root, "鼠标指针"));
 			selfElement.tabStop = GetXmlBoolAttribute(root, "可停留焦点", true);
+			selfElement.locked = GetXmlBoolAttribute(root, "锁定", false);
 			selfElement.tabIndex = GetXmlIntAttribute(root, "停留顺序", 0);
 			selfElement.extensionData = DecodeBase64(GetXmlAttribute(root, "扩展属性数据"));
 			selfElement.events = ReadFormControlEventsFromXml(
@@ -9068,8 +9134,19 @@ bool CanReuseNativeBytesForSemanticEquivalentSources(
 	if (HasPersistedEComPathOverride(bundle)) {
 		return false;
 	}
+	if (bundle.projectSubsystem != originalBundle.projectSubsystem) {
+		return false;
+	}
+	if (bundle.projectSubsystem == ProjectSubsystem::WindowsGui) {
+		return false;
+	}
 	if (ComputeBundleDigestWithoutSourceFiles(bundle) !=
 		ComputeBundleDigestWithoutSourceFiles(originalBundle)) {
+		return false;
+	}
+	// Shape digests intentionally ignore some textual details. Native bytes are
+	// reusable only when the complete source projection is also unchanged.
+	if (ComputeBundleDigest(bundle) != ComputeBundleDigest(originalBundle)) {
 		return false;
 	}
 
@@ -9216,6 +9293,9 @@ bool BuildRestoreModel(
 		model.projectName = bundle->projectName;
 	}
 	model.versionText = document.versionText.empty() ? "1.0" : document.versionText;
+	if (bundle != nullptr) {
+		model.projectSubsystem = bundle->projectSubsystem;
+	}
 	for (const auto& dependency : document.dependencies) {
 		RestoreDependencyInfo item;
 		item.name = dependency.name;
@@ -9354,6 +9434,23 @@ bool BuildRestoreModel(
 
 	IdAllocator allocator;
 	TypeResolver resolver(document.sourcePath, model.dependencies);
+	// EC bridge sources can reference native snapshot types that are absent from
+	// the exported public header. Register only names backed by preserved IDs.
+	if (bundle != nullptr && bundle->sourceFileKind == SourceFileKind::EC) {
+		for (const auto& snapshot : bundle->nativeStructSnapshots) {
+			if (snapshot.id != 0 && !snapshot.name.empty()) {
+				resolver.RegisterUserType(snapshot.name, snapshot.id);
+			}
+		}
+		const size_t classLimit = (std::min)(bundle->sourceFiles.size(), bundle->nativeSourceSnapshots.size());
+		for (size_t index = 0; index < classLimit; ++index) {
+			const auto& sourceFile = bundle->sourceFiles[index];
+			const auto& snapshot = bundle->nativeSourceSnapshots[index];
+			if (snapshot.classId != 0 && !sourceFile.logicalName.empty()) {
+				resolver.RegisterUserType(sourceFile.logicalName, snapshot.classId);
+			}
+		}
+	}
 
 	std::vector<const BundleNativeSourceFileSnapshot*> nativeSourceSnapshotsByIndex(parsedClasses.size(), nullptr);
 	if (bundle != nullptr) {
@@ -9415,7 +9512,7 @@ bool BuildRestoreModel(
 		if (const std::int32_t typeId = resolver.ResolveTypeId(typeName); typeId != 0) {
 			return typeId;
 		}
-		if (bundle != nullptr) {
+		if (bundle != nullptr && bundle->sourceFileKind != SourceFileKind::EC) {
 			if (std::find(unresolvedTypeNames.begin(), unresolvedTypeNames.end(), typeName) == unresolvedTypeNames.end()) {
 				unresolvedTypeNames.push_back(typeName);
 			}
@@ -11138,12 +11235,15 @@ bool BuildRestoreModel(
 				originalParsedMethod != nullptr &&
 				AreParsedMethodsTextuallyEquivalent(parsedMethod, *originalParsedMethod);
 			if (!preparedMethod.rebuildRawSupportObjectCalls &&
-				(reusableNativeMethodSnapshot != nullptr ||
+				((reusableNativeMethodSnapshot != nullptr && methodTextUnchanged) ||
 				(canReuseIdentityNativeMethodSnapshot &&
 					methodTextUnchanged) ||
-				(preferNativeMethodSnapshots && identityNativeMethodSnapshot != nullptr))) {
+				(preferNativeMethodSnapshots && identityNativeMethodSnapshot != nullptr &&
+					methodTextUnchanged))) {
 				const BundleNativeMethodSnapshot* nativeMethodSnapshot =
-					reusableNativeMethodSnapshot != nullptr ? reusableNativeMethodSnapshot : identityNativeMethodSnapshot;
+					(reusableNativeMethodSnapshot != nullptr && methodTextUnchanged)
+						? reusableNativeMethodSnapshot
+						: identityNativeMethodSnapshot;
 				method.lineOffset = nativeMethodSnapshot->lineOffset;
 				method.blockOffset = nativeMethodSnapshot->blockOffset;
 				method.methodReference = nativeMethodSnapshot->methodReference;
@@ -11449,6 +11549,9 @@ bool BuildRestoreModel(
 bool CanReuseNativeBundleSnapshot(const ProjectBundle& bundle)
 {
 	if (bundle.nativeSourceBytes.empty() || bundle.nativeBundleDigest.empty()) {
+		return false;
+	}
+	if (bundle.projectSubsystem == ProjectSubsystem::WindowsGui && bundle.formFiles.empty()) {
 		return false;
 	}
 	for (const auto& sourceFile : bundle.sourceFiles) {
@@ -12201,7 +12304,7 @@ void WriteConstants(ByteWriter& writer, const std::vector<RestoreConstant>& cons
 		}
 		if (const auto boolValue = ParseBoolLiteral(valueText); boolValue.has_value()) {
 			out.WriteU8(kConstTypeBool);
-			out.WriteBool32(*boolValue);
+			out.WriteI16(*boolValue ? static_cast<std::int16_t>(-1) : static_cast<std::int16_t>(0));
 			return;
 		}
 
@@ -12380,7 +12483,7 @@ std::int32_t ComputeAllocatedIdNum(const RestoreDocumentModel& model)
 	return maxId;
 }
 
-std::vector<std::uint8_t> BuildSystemInfoSection(const RestoreDocumentModel&)
+std::vector<std::uint8_t> BuildSystemInfoSection(const RestoreDocumentModel& model)
 {
 	ByteWriter writer;
 	writer.WriteI16(5);
@@ -12391,7 +12494,7 @@ std::vector<std::uint8_t> BuildSystemInfoSection(const RestoreDocumentModel&)
 	writer.WriteI16(7);
 	writer.WriteI32(1);
 	writer.WriteI32(0);
-	writer.WriteI32(0);
+	writer.WriteI32(model.projectSubsystem == ProjectSubsystem::WindowsGui ? 0 : 1);
 	for (int i = 0; i < 8; ++i) {
 		writer.WriteI32(0);
 	}

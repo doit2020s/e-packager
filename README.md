@@ -2,6 +2,10 @@
 
 将易语言 `.e` / `.ec` 文件解包为可读目录，或将目录回包为 `.e`，让易语言项目享有 Git 版本管理、代码 Diff、AI 辅助编辑等现代开发体验。
 
+当前 AutoLinker 定制版为 `1.2.8-autolinker.1`。它以官方 `v1.2.8` 的解包/回包修复为同步基线，保留数组专用检查、内置 `tool/RSCProject.dll`、原生结构与支持库符号保真。已合入布尔常量、`.ec` 类型映射、工程子系统、旧新版事件表、匿名类型、行尾注释、方法快照、全角/半角运算符和字节集参数切分修复。
+
+本定制版不包含官方后续加入的独立编译器、黑月编译路径、通用源码预检、`compile-check` 或支持库窗口属性探测器。窗口扩展属性继续按原始字节保留，避免独立进程装载 `RSCProject.fne`；实时窗口设计和权威编译由 AutoLinker Bridge/Service 负责。
+
 > 📖 参考应用：[易语言 × AI Agent 实践白皮书](https://github.com/aiqinxuancai/Awesome-E-Agent)
 > 
 > 📖 [易语言AutoLinker支持库，提供**无头编译**，用于AI使用本项目编辑代码后的验证编译](https://github.com/aiqinxuancai/AutoLinker)
@@ -97,6 +101,14 @@ e-packager validate <input-dir>
 数组维度写在第四字段，例如 `.局部变量 arr, 整数型, , "0"`、`"2,3"` 或 `",4"`。参数第三字段中的 `参考 数组` 属于合法参数属性。非数组语法、类型、名称连接、窗口绑定和运行期问题不由 `validate` 拦截，应保留真实回包错误，并由易语言 IDE 或 AutoLinker 诊断。
 
 新增或修改的可执行语句仍必须能够编码成真实易语言结构；编码失败会中止回包，不会伪造命令、常量或类型 ID。
+
+开发版的解包/回包核心集中验收使用：
+
+```powershell
+.\tools\TestRoundtripCore.ps1
+```
+
+测试产物只写入仓库的 `.autolinker/work`，不会覆盖模板或用户工程。
 
 ### 支持库命令与 RSCProject
 

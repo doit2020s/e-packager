@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <cstddef>
 #include <exception>
@@ -80,6 +81,13 @@ void RunFixedThreadTasks(
 enum class SourceFileKind {
 	E,
 	EC,
+};
+
+// Executable subsystem recorded by the E-language system-info section.
+enum class ProjectSubsystem {
+	Unknown,
+	Console,
+	WindowsGui,
 };
 
 // 依赖项类型。
@@ -334,6 +342,7 @@ struct ProjectBundle {
 	std::string projectName;
 	bool projectNameStored = false;
 	std::string versionText;
+	ProjectSubsystem projectSubsystem = ProjectSubsystem::Unknown;
 	std::int32_t bundleFormatVersion = 0;
 	std::vector<Dependency> dependencies;
 	std::vector<BundleSourceFile> sourceFiles;
@@ -405,6 +414,28 @@ struct Document {
 struct GenerateOptions {
 	bool includeImportedPages = false;
 };
+
+inline const char* ProjectSubsystemToText(const ProjectSubsystem value)
+{
+	switch (value) {
+	case ProjectSubsystem::Console: return "console";
+	case ProjectSubsystem::WindowsGui: return "windows";
+	default: return "unknown";
+	}
+}
+
+inline ProjectSubsystem ProjectSubsystemFromText(const std::string& text)
+{
+	std::string normalized = text;
+	std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](const unsigned char value) {
+		return static_cast<char>(std::tolower(value));
+	});
+	if (normalized == "console") return ProjectSubsystem::Console;
+	if (normalized == "windows" || normalized == "windowsgui" || normalized == "gui") {
+		return ProjectSubsystem::WindowsGui;
+	}
+	return ProjectSubsystem::Unknown;
+}
 
 // 读取源工程文件时的附加选项。
 struct ReadOptions {

@@ -2011,8 +2011,8 @@ bool ParseConstants(std::int32_t count, const std::vector<std::uint8_t>& bytes, 
 				break;
 			}
 			case kConstTypeBool: {
-				std::int32_t value = 0;
-				if (!itemReader.ReadI32(value)) {
+				std::int16_t value = 0;
+				if (!itemReader.ReadI16(value)) {
 					return false;
 				}
 				item.valueText = value != 0 ? "真" : "假";
@@ -3023,15 +3023,26 @@ std::vector<std::string> BuildSupportTypeEventNames(const LIB_DATA_TYPE_INFO& da
 	if (dataType.m_nEventCount <= 0 ||
 		dataType.m_nEventCount > kMaxSupportLibraryArrayCount ||
 		dataType.m_pEventBegin == nullptr ||
-		!IsReadableMemoryRange(
+		!IsReadableMemoryRange(dataType.m_pEventBegin, sizeof(EVENT_INFO))) {
+		return eventNames;
+	}
+	const auto* first = reinterpret_cast<const EVENT_INFO*>(dataType.m_pEventBegin);
+	const bool version2 = (first->m_dwState & EV_IS_VER2) != 0;
+	const size_t stride = version2 ? sizeof(EVENT_INFO2) : sizeof(EVENT_INFO);
+	if (!IsReadableMemoryRange(
 			dataType.m_pEventBegin,
-			sizeof(EVENT_INFO2) * static_cast<size_t>(dataType.m_nEventCount))) {
+			stride * static_cast<size_t>(dataType.m_nEventCount))) {
 		return eventNames;
 	}
 
 	eventNames.reserve(static_cast<size_t>(dataType.m_nEventCount));
 	for (int eventIndex = 0; eventIndex < dataType.m_nEventCount; ++eventIndex) {
-		eventNames.emplace_back(ReadSupportLibraryName(dataType.m_pEventBegin[eventIndex].m_szName));
+		const auto* address = reinterpret_cast<const std::uint8_t*>(dataType.m_pEventBegin) +
+			stride * static_cast<size_t>(eventIndex);
+		const char* name = version2
+			? reinterpret_cast<const EVENT_INFO2*>(address)->m_szName
+			: reinterpret_cast<const EVENT_INFO*>(address)->m_szName;
+		eventNames.emplace_back(ReadSupportLibraryName(name));
 	}
 	return eventNames;
 }
@@ -3078,13 +3089,26 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 		return candidates;
 	}
 
-	std::filesystem::path filePath = std::filesystem::path(libraryFileName);
-	if (!filePath.has_extension()) {
-		filePath += ".fne";
+	const std::filesystem::path filePath = std::filesystem::path(libraryFileName);
+	std::vector<std::filesystem::path> fileVariants;
+	if (filePath.has_extension()) {
+		fileVariants.push_back(filePath);
+		if (filePath.extension() == ".fne") {
+			fileVariants.push_back(filePath.string() + ".dll");
+		}
+	}
+	else {
+		fileVariants.push_back(filePath.string() + ".fne");
+		fileVariants.push_back(filePath.string() + ".fne.dll");
+		fileVariants.push_back(filePath.string() + ".fnr");
+		fileVariants.push_back(filePath.string() + ".dll");
+		fileVariants.push_back(filePath);
 	}
 
 	if (filePath.is_absolute()) {
-		PushUniqueCandidate(candidates, filePath);
+		for (const auto& variant : fileVariants) {
+			PushUniqueCandidate(candidates, variant);
+		}
 		return candidates;
 	}
 
@@ -3092,16 +3116,18 @@ std::vector<std::filesystem::path> BuildSupportLibraryCandidatePaths(
 		if (baseDir.empty()) {
 			return;
 		}
-		PushUniqueCandidate(candidates, baseDir / filePath);
-		PushUniqueCandidate(candidates, baseDir / "lib" / filePath);
+		for (const auto& variant : fileVariants) {
+			PushUniqueCandidate(candidates, baseDir / variant);
+			PushUniqueCandidate(candidates, baseDir / "lib" / variant);
 
-		std::filesystem::path current = baseDir;
-		while (!current.empty()) {
-			PushUniqueCandidate(candidates, current / "lib" / filePath);
-			if (current == current.root_path()) {
-				break;
+			std::filesystem::path current = baseDir;
+			while (!current.empty()) {
+				PushUniqueCandidate(candidates, current / "lib" / variant);
+				if (current == current.root_path()) {
+					break;
+				}
+				current = current.parent_path();
 			}
-			current = current.parent_path();
 		}
 	};
 
@@ -3199,6 +3225,7 @@ public:
 		, m_sourceFileKind(DetectSourceFileKindFromPath(sourcePath))
 		, m_removedDefinedItems(removedDefinedItems)
 	{
+		BuildClassTypePageMap();
 		BuildUserNameCache();
 	}
 
@@ -3206,6 +3233,10 @@ public:
 	{
 		if (typeValue == 0) {
 			return std::string();
+		}
+		if (const auto mappedPage = m_classTypePageById.find(typeValue);
+			mappedPage != m_classTypePageById.end()) {
+			return ResolveUserName(mappedPage->second);
 		}
 		for (const auto& dataType : m_program.dataTypes) {
 			if (dataType.header.dwId == typeValue || dataType.header.dwUnk == typeValue) {
@@ -3486,6 +3517,30 @@ private:
 			return name;
 		}
 		return BuildSequentialPlaceholderName(prefix, counter);
+	}
+
+	void BuildClassTypePageMap()
+	{
+		std::unordered_set<std::int32_t> ambiguousTypeIds;
+		for (const auto& page : m_program.codePages) {
+			for (const std::int32_t functionId : page.functionIds) {
+				const auto function = std::find_if(
+					m_program.functions.begin(),
+					m_program.functions.end(),
+					[functionId](const FunctionInfo& item) { return item.header.dwId == functionId; });
+				if (function == m_program.functions.end() ||
+					function->ownerClass == 0 || function->ownerClass == -1) {
+					continue;
+				}
+				const auto [existing, inserted] = m_classTypePageById.emplace(function->ownerClass, page.header.dwId);
+				if (!inserted && existing->second != page.header.dwId) {
+					ambiguousTypeIds.insert(function->ownerClass);
+				}
+			}
+		}
+		for (const std::int32_t typeId : ambiguousTypeIds) {
+			m_classTypePageById.erase(typeId);
+		}
 	}
 
 	void BuildUserNameCache()
@@ -3828,6 +3883,7 @@ private:
 	SourceFileKind m_sourceFileKind = SourceFileKind::E;
 	const std::vector<RemovedDefinedItemInfo>* m_removedDefinedItems = nullptr;
 	std::unordered_map<std::int32_t, std::string> m_userNameCache;
+	std::unordered_map<std::int32_t, std::int32_t> m_classTypePageById;
 	std::unordered_map<std::int32_t, std::string> m_methodOwnerNameCache;
 	std::unordered_map<std::uint16_t, SupportLibrarySymbols> m_supportCache;
 };
@@ -3849,17 +3905,6 @@ bool IsAnonymousPlaceholderTypeName(const std::string& typeName)
 		typeName.empty() ||
 		typeName.rfind("_Struct_0x", 0) == 0 ||
 		typeName.rfind("匿名数据类型_", 0) == 0;
-}
-
-void SetAnonymousTypeAlias(
-	std::unordered_map<std::int32_t, std::string>& aliases,
-	std::int32_t typeId,
-	const std::string& alias)
-{
-	if (typeId == 0 || alias.empty()) {
-		return;
-	}
-	aliases.insert_or_assign(typeId, alias);
 }
 
 bool MatchAllMemberTypes(
@@ -3895,6 +3940,14 @@ bool MatchWndClassExShape(const std::vector<VariableInfo>& members)
 std::unordered_map<std::int32_t, std::string> BuildLocalAnonymousTypeAliasMap(const ModuleSections& sections)
 {
 	std::unordered_map<std::int32_t, std::string> aliases;
+	std::unordered_set<std::string> usedAliases;
+	const auto setUniqueAlias = [&](const std::int32_t typeId, const std::string& alias) {
+		if (typeId == 0 || alias.empty() || aliases.contains(typeId) || usedAliases.contains(alias)) {
+			return;
+		}
+		aliases.emplace(typeId, alias);
+		usedAliases.insert(alias);
+	};
 
 	for (const auto& item : sections.program.dataTypes) {
 		const std::string ownerName = TrimAsciiCopy(item.name);
@@ -3907,10 +3960,10 @@ std::unordered_map<std::int32_t, std::string> BuildLocalAnonymousTypeAliasMap(co
 				continue;
 			}
 			if (ownerName == "WFSYSCTLBTN" && memberName == "Tips") {
-				SetAnonymousTypeAlias(aliases, member.dataType, "WFTIPSINFO");
+				setUniqueAlias(member.dataType, "WFTIPSINFO");
 			}
 			else if (ownerName == "WFSHADOWINFO" && memberName == "Canvas") {
-				SetAnonymousTypeAlias(aliases, member.dataType, "WFCANVAS");
+				setUniqueAlias(member.dataType, "WFCANVAS");
 			}
 		}
 	}
@@ -3927,10 +3980,10 @@ std::unordered_map<std::int32_t, std::string> BuildLocalAnonymousTypeAliasMap(co
 			}
 			if ((dllName == "GdipDrawString" || dllName == "GdipMeasureString") &&
 				(paramName == "layoutRect" || paramName == "boundingBox")) {
-				SetAnonymousTypeAlias(aliases, param.dataType, "RectF");
+				setUniqueAlias(param.dataType, "RectF");
 			}
 			else if (dllName == "RegisterClassExW" && paramName == "pcWndClassEx") {
-				SetAnonymousTypeAlias(aliases, param.dataType, "WNDCLASSEXW");
+				setUniqueAlias(param.dataType, "WNDCLASSEXW");
 			}
 		}
 	}
@@ -3943,10 +3996,10 @@ std::unordered_map<std::int32_t, std::string> BuildLocalAnonymousTypeAliasMap(co
 			continue;
 		}
 		if (MatchAllMemberTypes(item.members, static_cast<std::int32_t>(0x80000501u), 4)) {
-			SetAnonymousTypeAlias(aliases, item.header.dwId, "RectF");
+			setUniqueAlias(item.header.dwId, "RectF");
 		}
 		else if (MatchWndClassExShape(item.members)) {
-			SetAnonymousTypeAlias(aliases, item.header.dwId, "WNDCLASSEXW");
+			setUniqueAlias(item.header.dwId, "WNDCLASSEXW");
 		}
 	}
 
@@ -4082,12 +4135,35 @@ std::string BuildVarFlags(const VariableInfo& info)
 	return JoinStrings(parts, " ");
 }
 
-std::string BuildTypeField(const VariableInfo& info, SymbolResolver& resolver)
+std::string ResolveTypeWithHints(
+	const std::int32_t typeId,
+	SymbolResolver& resolver,
+	const AnonymousTypeHints& hints)
 {
-	return TrimAsciiCopy(resolver.ResolveType(info.dataType));
+	const std::string resolved = TrimAsciiCopy(resolver.ResolveType(typeId));
+	if (!IsAnonymousPlaceholderTypeName(resolved)) {
+		return resolved;
+	}
+	if (const auto it = hints.localTypeAliases.find(typeId); it != hints.localTypeAliases.end()) {
+		return it->second;
+	}
+	return resolved;
 }
 
-std::string BuildMethodParameterLine(const VariableInfo& info, SymbolResolver& resolver)
+std::string BuildTypeField(
+	const VariableInfo& info,
+	SymbolResolver& resolver,
+	const AnonymousTypeHints* hints = nullptr)
+{
+	return hints == nullptr
+		? TrimAsciiCopy(resolver.ResolveType(info.dataType))
+		: ResolveTypeWithHints(info.dataType, resolver, *hints);
+}
+
+std::string BuildMethodParameterLine(
+	const VariableInfo& info,
+	SymbolResolver& resolver,
+	const AnonymousTypeHints* hints = nullptr)
 {
 	std::vector<std::string> flags;
 	if ((info.attr & kVarAttrByRef) != 0) {
@@ -4103,45 +4179,54 @@ std::string BuildMethodParameterLine(const VariableInfo& info, SymbolResolver& r
 		"参数",
 		{
 			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
-			BuildTypeField(info, resolver),
+			BuildTypeField(info, resolver, hints),
 			JoinStrings(flags, " "),
 			TrimAsciiCopy(info.comment),
 		});
 }
 
-std::string BuildLocalVariableLine(const VariableInfo& info, SymbolResolver& resolver)
+std::string BuildLocalVariableLine(
+	const VariableInfo& info,
+	SymbolResolver& resolver,
+	const AnonymousTypeHints* hints = nullptr)
 {
 	return BuildDefinitionLine(
 		"局部变量",
 		{
 			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
-			BuildTypeField(info, resolver),
+			BuildTypeField(info, resolver, hints),
 			(info.attr & 0x0001) != 0 ? "静态" : std::string(),
 			BuildArraySuffix(info.arrayBounds),
 			TrimAsciiCopy(info.comment),
 		});
 }
 
-std::string BuildClassVariableLine(const VariableInfo& info, SymbolResolver& resolver)
+std::string BuildClassVariableLine(
+	const VariableInfo& info,
+	SymbolResolver& resolver,
+	const AnonymousTypeHints* hints = nullptr)
 {
 	return BuildDefinitionLine(
 		"程序集变量",
 		{
 			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
-			BuildTypeField(info, resolver),
+			BuildTypeField(info, resolver, hints),
 			std::string(),
 			BuildArraySuffix(info.arrayBounds),
 			TrimAsciiCopy(info.comment),
 		});
 }
 
-std::string BuildGlobalVariableLine(const VariableInfo& info, SymbolResolver& resolver)
+std::string BuildGlobalVariableLine(
+	const VariableInfo& info,
+	SymbolResolver& resolver,
+	const AnonymousTypeHints* hints = nullptr)
 {
 	return BuildDefinitionLine(
 		"全局变量",
 		{
 			TrimAsciiCopy(resolver.ResolveUserName(info.marker)),
-			BuildTypeField(info, resolver),
+			BuildTypeField(info, resolver, hints),
 			(info.attr & 0x0100) != 0 ? "公开" : std::string(),
 			BuildArraySuffix(info.arrayBounds),
 			TrimAsciiCopy(info.comment),
@@ -4265,9 +4350,12 @@ bool IsAnonymousRootProgramPage(const CodePageInfo& page)
 	return IsRootProgramPage(page) && IsAnonymousProgramPage(page);
 }
 
-std::string ResolveProgramPageLogicalName(const ProgramSection& program, const CodePageInfo& page)
+std::string ResolveProgramPageLogicalName(
+	const ProgramSection& program,
+	const CodePageInfo& page,
+	SymbolResolver& resolver)
 {
-	std::string logicalName = TrimAsciiCopy(page.name);
+	std::string logicalName = TrimAsciiCopy(resolver.ResolveUserName(page.header.dwId));
 	if (!logicalName.empty()) {
 		return logicalName;
 	}
@@ -5622,7 +5710,11 @@ bool IsProgramPagePublic(const ModuleSections& sections, std::int32_t pageId)
 	return false;
 }
 
-void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& options, Document& outDocument)
+void BuildProgramPages(
+	const ModuleSections& sections,
+	const AnonymousTypeHints& hints,
+	const GenerateOptions& options,
+	Document& outDocument)
 {
 	SymbolResolver resolver(
 		sections.program,
@@ -5637,7 +5729,7 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 		if (!ShouldKeepPage(sections, dependencyRecords, pageInfo, functions, options.includeImportedPages)) {
 			continue;
 		}
-		const std::string logicalPageName = ResolveProgramPageLogicalName(sections.program, pageInfo);
+		const std::string logicalPageName = ResolveProgramPageLogicalName(sections.program, pageInfo, resolver);
 		TraceLine("BuildProgramPages page=" + logicalPageName + " funcs=" + std::to_string(functions.size()));
 
 		Page page;
@@ -5673,7 +5765,7 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 			headerFields));
 
 		for (const auto& pageVar : pageInfo.pageVars) {
-			AppendLine(page, BuildClassVariableLine(pageVar, resolver));
+			AppendLine(page, BuildClassVariableLine(pageVar, resolver, &hints));
 		}
 		AppendLine(page, "");
 
@@ -5686,17 +5778,17 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 				"子程序",
 				{
 					TrimAsciiCopy(resolver.ResolveUserName(functionInfo->header.dwId)),
-					TrimAsciiCopy(resolver.ResolveType(functionInfo->returnType)),
+					ResolveTypeWithHints(functionInfo->returnType, resolver, hints),
 					(functionInfo->attr & 0x8) != 0 ? "公开" : std::string(),
 					TrimAsciiCopy(functionInfo->comment),
 				}));
 
 				for (const auto& param : functionInfo->params) {
-					AppendLine(page, BuildMethodParameterLine(param, resolver));
+					AppendLine(page, BuildMethodParameterLine(param, resolver, &hints));
 				}
 
 				for (const auto& local : functionInfo->locals) {
-					AppendLine(page, BuildLocalVariableLine(local, resolver));
+					AppendLine(page, BuildLocalVariableLine(local, resolver, &hints));
 				}
 
 				std::vector<std::string> bodyLines;
@@ -5736,7 +5828,10 @@ void BuildProgramPages(const ModuleSections& sections, const GenerateOptions& op
 	TraceLine("BuildProgramPages end count=" + std::to_string(outDocument.pages.size()));
 }
 
-void BuildGlobalPage(const ModuleSections& sections, Document& outDocument)
+void BuildGlobalPage(
+	const ModuleSections& sections,
+	const AnonymousTypeHints& hints,
+	Document& outDocument)
 {
 	if (sections.program.globals.empty()) {
 		return;
@@ -5758,7 +5853,7 @@ void BuildGlobalPage(const ModuleSections& sections, Document& outDocument)
 		if (IsGlobalHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker)) {
 			continue;
 		}
-		AppendLine(page, BuildGlobalVariableLine(item, resolver));
+		AppendLine(page, BuildGlobalVariableLine(item, resolver, &hints));
 	}
 	if (page.lines.size() > 2) {
 		outDocument.pages.push_back(std::move(page));
@@ -6103,6 +6198,9 @@ std::vector<std::pair<std::string, std::string>> BuildFormControlXmlAttributes(
 	if (item.tabIndex != 0) {
 		attributes.emplace_back("停留顺序", std::to_string(item.tabIndex));
 	}
+	if (item.locked) {
+		attributes.emplace_back("锁定", BoolToEText(true));
+	}
 	attributes.emplace_back("扩展属性数据", EncodeBase64(item.extensionData));
 	return attributes;
 }
@@ -6386,8 +6484,8 @@ bool BuildDocumentFromSections(
 
 	BuildDependencies(sections, document);
 	const AnonymousTypeHints anonymousTypeHints = BuildAnonymousTypeHints(sections, sourcePath);
-	BuildProgramPages(sections, options, document);
-	BuildGlobalPage(sections, document);
+	BuildProgramPages(sections, anonymousTypeHints, options, document);
+	BuildGlobalPage(sections, anonymousTypeHints, document);
 	BuildStructPage(sections, anonymousTypeHints, document);
 	BuildDllPage(sections, anonymousTypeHints, document);
 	BuildFormPage(sections, document);
@@ -7125,6 +7223,14 @@ bool BuildBundleFromSections(
 	bundle.projectName = document.projectName;
 	bundle.projectNameStored = sections.hasUserInfo && !TrimAsciiCopy(sections.userInfo.programName).empty();
 	bundle.versionText = document.versionText;
+	if (sections.hasSystemInfo) {
+		if (sections.systemInfo.compileType == 0) {
+			bundle.projectSubsystem = ProjectSubsystem::WindowsGui;
+		}
+		else if (sections.systemInfo.compileType == 1) {
+			bundle.projectSubsystem = ProjectSubsystem::Console;
+		}
+	}
 	bundle.dependencies = document.dependencies;
 	bundle.nativeProgramHeader = BundleNativeProgramHeaderSnapshot{
 		sections.program.header.versionFlag1,
@@ -7158,7 +7264,7 @@ bool BuildBundleFromSections(
 		}
 		itemKeys.insert_or_assign(
 			pageInfo.header.dwId,
-			BuildItemKey("class", ResolveProgramPageLogicalName(sections.program, pageInfo), keyCounters));
+			BuildItemKey("class", ResolveProgramPageLogicalName(sections.program, pageInfo, resolver), keyCounters));
 	}
 	for (const auto& item : sections.program.globals) {
 		if (IsGlobalHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker)) {
@@ -7237,7 +7343,7 @@ bool BuildBundleFromSections(
 			file.key = itemKeys[pageInfo.header.dwId];
 			file.logicalName = TrimAsciiCopy(page.name);
 			if (file.logicalName.empty()) {
-				file.logicalName = ResolveProgramPageLogicalName(sections.program, pageInfo);
+				file.logicalName = ResolveProgramPageLogicalName(sections.program, pageInfo, resolver);
 			}
 			file.relativePath = MakeUniqueRelativePath(
 				BuildRelativePath(
@@ -7945,6 +8051,7 @@ std::string ComputeBundleDigestInternal(const ProjectBundle& bundle, const bool 
 	BundleDigestWriter writer;
 	writer.WriteString(bundle.projectName);
 	writer.WriteString(bundle.versionText);
+	writer.WriteI32(static_cast<std::int32_t>(bundle.projectSubsystem));
 
 	writer.WriteU64(static_cast<std::uint64_t>(bundle.dependencies.size()));
 	for (const auto& item : bundle.dependencies) {
