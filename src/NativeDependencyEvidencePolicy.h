@@ -208,6 +208,29 @@ inline bool DoesCanonicalDependencyImportedTypeMatch(
 	return hostCategory != 0 && hostCategory == normalizeUserType(canonicalNativeType);
 }
 
+// Older EC imports can preserve fixed struct-member bounds while omitting the
+// redundant array attribute bit in the host table. Treat that single-bit drift
+// as equivalent only when identical, non-empty bounds independently prove the
+// array declaration; every other attribute and all bounds remain exact.
+inline bool DoesNativeDependencyVariableShapeMatch(
+	const std::int16_t parsedAttributes,
+	const std::int16_t hostAttributes,
+	const std::int16_t relevantAttributeMask,
+	const std::int16_t arrayAttribute,
+	const std::vector<std::int32_t>& parsedBounds,
+	const std::vector<std::int32_t>& hostBounds,
+	const bool allowBoundEncodedArrayAttribute)
+{
+	if (parsedBounds != hostBounds) {
+		return false;
+	}
+	const std::int16_t attributeDifference =
+		(parsedAttributes ^ hostAttributes) & relevantAttributeMask;
+	return attributeDifference == 0 ||
+		(allowBoundEncodedArrayAttribute && !parsedBounds.empty() &&
+			attributeDifference == arrayAttribute);
+}
+
 // A loaded EC has its own native ID space. Select a DLL declaration snapshot
 // only when the public text declaration still matches one unique native slot;
 // callers can then use its return/parameter type IDs as canonical type-name

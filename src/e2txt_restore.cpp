@@ -11487,12 +11487,18 @@ bool BuildRestoreModel(
 			for (size_t memberIndex = 0; memberIndex < parsedStruct.members.size(); ++memberIndex) {
 				const auto& parsedMember = parsedStruct.members[memberIndex];
 				const auto& nativeMember = nativeStruct.members[memberIndex];
+				const auto parsedBounds = ParseArrayBounds(parsedMember.arrayText);
 				if (TypeResolver::NormalizeTypeName(parsedMember.name) !=
 						TypeResolver::NormalizeTypeName(nativeMember.name) ||
 					!nativeTypeMatches(parsedMember.typeName, nativeMember.dataType) ||
-					(BuildVariableAttr(parsedMember, false, false) & kSignatureAttrMask) !=
-						(nativeMember.attr & kSignatureAttrMask) ||
-					ParseArrayBounds(parsedMember.arrayText) != nativeMember.arrayBounds) {
+					!DoesNativeDependencyVariableShapeMatch(
+						BuildVariableAttr(parsedMember, false, false),
+						nativeMember.attr,
+						kSignatureAttrMask,
+						kVarAttrArray,
+						parsedBounds,
+						nativeMember.arrayBounds,
+						true)) {
 					return false;
 				}
 			}
@@ -12258,15 +12264,22 @@ bool BuildRestoreModel(
 			const ParsedVariableDef& parsed,
 			const TNativeVariable& native,
 			const bool allowStatic,
-			const std::int32_t canonicalNativeType = 0) {
+			const std::int32_t canonicalNativeType = 0,
+			const bool allowBoundEncodedArrayAttribute = false) {
 			constexpr std::int16_t kDeclarationAttrMask =
 				kVarAttrStatic | kVarAttrByRef | kVarAttrNullable | kVarAttrArray;
+			const auto parsedBounds = ParseArrayBounds(parsed.arrayText);
 			return TypeResolver::NormalizeTypeName(parsed.name) ==
 					TypeResolver::NormalizeTypeName(native.name) &&
 				nativeTypeMatchesForImport(parsed.typeName, native.dataType, canonicalNativeType) &&
-				(BuildVariableAttr(parsed, allowStatic, false) & kDeclarationAttrMask) ==
-					(native.attr & kDeclarationAttrMask) &&
-				ParseArrayBounds(parsed.arrayText) == native.arrayBounds;
+				DoesNativeDependencyVariableShapeMatch(
+					BuildVariableAttr(parsed, allowStatic, false),
+					native.attr,
+					kDeclarationAttrMask,
+					kVarAttrArray,
+					parsedBounds,
+					native.arrayBounds,
+					allowBoundEncodedArrayAttribute);
 		};
 		const auto nativeStructDeclarationMatches = [&](const ParsedStructDef& parsed,
 			const NativeDependencyStructSymbol& native,
@@ -12285,7 +12298,8 @@ bool BuildRestoreModel(
 						parsed.members[memberIndex],
 						native.members[memberIndex],
 						false,
-						canonicalSnapshot->memberTypes[memberIndex])) {
+						canonicalSnapshot->memberTypes[memberIndex],
+						true)) {
 					return false;
 				}
 			}

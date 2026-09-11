@@ -398,6 +398,26 @@ int main()
 			strictChildIds),
 		"missing, zero, mismatched, or wrong-category child IDs must reject the whole native evidence group");
 
+	constexpr std::int16_t variableShapeMask = 0x000E;
+	constexpr std::int16_t arrayAttribute = 0x0008;
+	check(e2txt::DoesNativeDependencyVariableShapeMatch(
+		arrayAttribute, 0, variableShapeMask, arrayAttribute,
+		std::vector<std::int32_t>{1}, std::vector<std::int32_t>{1}, true),
+		"fixed struct-member bounds must tolerate an omitted redundant host array attribute");
+	check(!e2txt::DoesNativeDependencyVariableShapeMatch(
+		arrayAttribute, 0, variableShapeMask, arrayAttribute,
+		std::vector<std::int32_t>{1}, std::vector<std::int32_t>{2}, true) &&
+		!e2txt::DoesNativeDependencyVariableShapeMatch(
+			arrayAttribute, 0, variableShapeMask, arrayAttribute,
+			{}, {}, true) &&
+		!e2txt::DoesNativeDependencyVariableShapeMatch(
+			arrayAttribute | 0x0002, 0, variableShapeMask, arrayAttribute,
+			std::vector<std::int32_t>{1}, std::vector<std::int32_t>{1}, true) &&
+		!e2txt::DoesNativeDependencyVariableShapeMatch(
+			arrayAttribute, 0, variableShapeMask, arrayAttribute,
+			std::vector<std::int32_t>{1}, std::vector<std::int32_t>{1}, false),
+		"bounds drift, unbounded arrays, other attribute drift, and non-struct declarations must remain strict");
+
 	e2txt::NativeChildIdRegistry childRegistry;
 	childRegistry.ObserveOccupied(0x25010001);
 	check(childRegistry.TryReserveGroup(
