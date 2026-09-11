@@ -49,6 +49,17 @@ function Assert-RuntimeLayout {
     }
 }
 
+function Assert-SingleEmbeddedRuntime {
+    param([Parameter(Mandatory)][string]$Workspace)
+    Assert-RuntimeLayout $Workspace
+    $expectedRuntime = [IO.Path]::GetFullPath((Join-Path $Workspace 'tool\RSCProject.dll'))
+    $allRuntimes = @(Get-ChildItem -LiteralPath $Workspace -Filter 'RSCProject.dll' -File -Recurse)
+    if ($allRuntimes.Count -ne 1 -or
+        [IO.Path]::GetFullPath($allRuntimes[0].FullName) -ne $expectedRuntime) {
+        throw "embedded RSCProject layout must contain only the top-level tool runtime: count=$($allRuntimes.Count)"
+    }
+}
+
 function Read-Meta {
     param([Parameter(Mandatory)][string]$Workspace)
     $path = Join-Path $Workspace 'project\_meta.json'
@@ -224,6 +235,7 @@ if ([string]::IsNullOrWhiteSpace([string]$genericDependency.localWorkspace) -or
     -not (Test-Path -LiteralPath (Join-Path $genericHostWorkspace $genericDependency.localWorkspace) -PathType Container)) {
     throw "update --add-ecom did not export a local module workspace: $($genericDependency.localWorkspace)"
 }
+Assert-SingleEmbeddedRuntime $genericHostWorkspace
 
 $genericHostOutput = Join-Path $OutputRoot 'generic-ecom-host.e'
 $genericHostUnpacked = Join-Path $OutputRoot 'generic-ecom-host-unpacked'

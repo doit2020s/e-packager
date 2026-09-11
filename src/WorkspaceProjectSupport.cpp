@@ -836,7 +836,7 @@ bool WriteWorkspaceFiles(
 	if (!CopyExecutableToToolDirectory(outputDir, outError)) {
 		return false;
 	}
-	if (!WriteEmbeddedRuntimeToToolDirectory(outputDir, outError)) {
+	if (options.writeEmbeddedRuntime && !WriteEmbeddedRuntimeToToolDirectory(outputDir, outError)) {
 		return false;
 	}
 
