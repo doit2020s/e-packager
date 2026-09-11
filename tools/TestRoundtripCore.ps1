@@ -136,6 +136,30 @@ function Test-NativeInt32Value {
     return $false
 }
 
+function Get-NativeByteSequenceCount {
+    param(
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [Parameter(Mandatory)][byte[]]$Sequence
+    )
+    if ($Sequence.Length -eq 0 -or $Bytes.Length -lt $Sequence.Length) {
+        return 0
+    }
+    $count = 0
+    for ($offset = 0; $offset -le $Bytes.Length - $Sequence.Length; $offset++) {
+        $matches = $true
+        for ($index = 0; $index -lt $Sequence.Length; $index++) {
+            if ($Bytes[$offset + $index] -ne $Sequence[$index]) {
+                $matches = $false
+                break
+            }
+        }
+        if ($matches) {
+            $count++
+        }
+    }
+    return $count
+}
+
 if (Test-Path -LiteralPath $OutputRoot) {
     Remove-Item -LiteralPath $OutputRoot -Recurse -Force
 }
@@ -1215,6 +1239,171 @@ if ((Get-FileHash -LiteralPath $controlSource1 -Algorithm SHA256).Hash -ne
     throw 'form control source projection is not stable after the second roundtrip'
 }
 
+# Cross-form control calls must rebuild against the current form/control identity.
+# A design-time control id can differ from the loaded support library's expression
+# owner type, so member properties must use the canonical type for that project slot.
+$crossControlWorkspace = Join-Path $OutputRoot 'cross-form-control-workspace'
+Copy-TestWorkspace $controlWorkspace $crossControlWorkspace
+$crossControlModulePath = Join-Path $crossControlWorkspace 'project\.module.json'
+$crossControlModule = Get-Content -LiteralPath $crossControlModulePath -Raw -Encoding UTF8 | ConvertFrom-Json
+if (-not @($crossControlModule.dependencies | Where-Object { $_.kind -eq 'elib' -and $_.fileName -eq 'iext' })) {
+    $crossControlModule.dependencies = @($crossControlModule.dependencies) + @([pscustomobject]@{
+        fileName = 'iext'
+        guid = '27bb20fdd3e145e4bee3db39ddd6e64c'
+        kind = 'elib'
+        name = '扩展界面支持库一'
+        path = ''
+        reExport = $false
+        versionText = '2.0'
+    })
+}
+Write-EText $crossControlModulePath (($crossControlModule | ConvertTo-Json -Depth 20) + "`r`n")
+$crossControlLibraries = @($crossControlModule.dependencies | Where-Object { $_.kind -eq 'elib' })
+$iextLibraryId = -1
+for ($index = 0; $index -lt $crossControlLibraries.Count; $index++) {
+    if ($crossControlLibraries[$index].fileName -eq 'iext') {
+        $iextLibraryId = $index
+        break
+    }
+}
+if ($iextLibraryId -lt 0) { throw 'cross-form fixture iext dependency missing' }
+$iextControlTypeId = (($iextLibraryId + 1) -shl 16) -bor 4
+
+$crossControlStartXmlPath = Join-Path $crossControlWorkspace "src\$controlWindowName.xml"
+[xml]$crossControlStartXml = [IO.File]::ReadAllText($crossControlStartXmlPath)
+$crossControlNode = $crossControlStartXml.CreateElement('超级列表框')
+$crossControlNode.SetAttribute('名称', '超级列表框1')
+$crossControlNode.SetAttribute('左边', '8')
+$crossControlNode.SetAttribute('顶边', '176')
+$crossControlNode.SetAttribute('宽度', '248')
+$crossControlNode.SetAttribute('高度', '48')
+$crossControlNode.SetAttribute('鼠标指针', 'AAAAAA==')
+$crossControlNode.SetAttribute('可停留焦点', '真')
+$crossControlNode.SetAttribute('扩展属性数据', '')
+$null = $crossControlStartXml.DocumentElement.AppendChild($crossControlNode)
+Write-EText $crossControlStartXmlPath $crossControlStartXml.OuterXml
+
+$crossControlStartProgramPath = Join-Path $crossControlWorkspace "src\窗口程序集$controlWindowName.txt"
+$crossControlStartProgram = @"
+.版本 2
+.支持库 iext
+
+.程序集 窗口程序集$controlWindowName
+
+.子程序 __启动窗口_创建完毕
+
+超级列表框1.置标题 (0, 0, “probe”)
+"@
+Write-EText $crossControlStartProgramPath $crossControlStartProgram
+
+$crossControlFormName = 'CrossFormProbe'
+$crossControlClassName = '窗口程序集_CrossFormProbe'
+$crossControlFormPath = Join-Path $crossControlWorkspace "src\$crossControlFormName.xml"
+$crossControlClassPath = Join-Path $crossControlWorkspace "src\$crossControlClassName.txt"
+$crossControlFormText = '<?xml version="1.0" encoding="UTF-8"?><窗口 名称="CrossFormProbe" 左边="10" 顶边="10" 宽度="120" 高度="80" 鼠标指针="AAAAAA==" 可停留焦点="假" 扩展属性数据="" />'
+Write-EText $crossControlFormPath $crossControlFormText
+$crossControlClassText = @'
+.版本 2
+.支持库 iext
+
+.程序集 窗口程序集_CrossFormProbe
+
+.子程序 ProbeCrossFormControl, 文本型
+
+返回 (_启动窗口.超级列表框1.取标题 (_启动窗口.超级列表框1.现行选中项, 1))
+
+.子程序 ProbeAdditiveAssociativity, 整数型
+
+返回 (10 ＋ 3 － 2)
+
+.子程序 ProbeMultiplicativeAssociativity, 双精度小数型
+
+返回 (24 × 3 ÷ 2)
+'@
+Write-EText $crossControlClassPath $crossControlClassText
+
+$crossControlMetaPath = Join-Path $crossControlWorkspace 'project\_meta.json'
+$crossControlMeta = Get-Content -LiteralPath $crossControlMetaPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$crossControlMeta.formFiles = @($crossControlMeta.formFiles) + @([pscustomobject]@{
+    key = "form:$crossControlFormName"
+    logicalName = $crossControlFormName
+    relativePath = "src/$crossControlFormName.xml"
+})
+$crossControlMeta.sourceFiles = @($crossControlMeta.sourceFiles) + @([pscustomobject]@{
+    key = "class:$crossControlClassName"
+    logicalName = $crossControlClassName
+    relativePath = "src/$crossControlClassName.txt"
+})
+$crossControlMeta.windowBindings = @($crossControlMeta.windowBindings) + @([pscustomobject]@{
+    className = $crossControlClassName
+    formName = $crossControlFormName
+})
+$crossControlMeta.rootChildKeys = @($crossControlMeta.rootChildKeys) + @(
+    "class:$crossControlClassName",
+    "form:$crossControlFormName"
+)
+Write-EText $crossControlMetaPath (($crossControlMeta | ConvertTo-Json -Depth 20) + "`r`n")
+
+$crossControlCandidate1 = Join-Path $OutputRoot 'cross-form-control-1.e'
+$crossControlUnpacked1 = Join-Path $OutputRoot 'cross-form-control-unpacked-1'
+$crossControlCandidate2 = Join-Path $OutputRoot 'cross-form-control-2.e'
+$crossControlUnpacked2 = Join-Path $OutputRoot 'cross-form-control-unpacked-2'
+Invoke-Packager @('pack', $crossControlWorkspace, $crossControlCandidate1)
+Invoke-Packager @('unpack', $crossControlCandidate1, $crossControlUnpacked1, '--main-only')
+Invoke-Packager @('compare-bundle', $crossControlCandidate1, $crossControlUnpacked1)
+Invoke-Packager @('pack', $crossControlUnpacked1, $crossControlCandidate2)
+Invoke-Packager @('unpack', $crossControlCandidate2, $crossControlUnpacked2, '--main-only')
+Invoke-Packager @('compare-bundle', $crossControlCandidate2, $crossControlUnpacked2)
+
+$crossControlExpectedLine = '返回 (_启动窗口.超级列表框1.取标题 (_启动窗口.超级列表框1.现行选中项, 1))'
+$additiveAssociativityLine = '返回 (10 ＋ 3 － 2)'
+$multiplicativeAssociativityLine = '返回 (24 × 3 ÷ 2)'
+$crossControlSource1 = Join-Path $crossControlUnpacked1 "src\$crossControlClassName.txt"
+$crossControlSource2 = Join-Path $crossControlUnpacked2 "src\$crossControlClassName.txt"
+foreach ($crossControlSource in @($crossControlSource1, $crossControlSource2)) {
+    $projection = [IO.File]::ReadAllText($crossControlSource)
+    if (-not $projection.Contains($crossControlExpectedLine) -or
+        -not $projection.Contains($additiveAssociativityLine) -or
+        -not $projection.Contains($multiplicativeAssociativityLine) -or
+        $projection.Contains('_Control_0x') -or
+        $projection.Contains('_Lib')) {
+        throw "cross-form control projection lost public identities: $projection"
+    }
+}
+if ((Get-FileHash -LiteralPath $crossControlSource1 -Algorithm SHA256).Hash -ne
+    (Get-FileHash -LiteralPath $crossControlSource2 -Algorithm SHA256).Hash) {
+    throw 'cross-form control source projection is not stable after the second roundtrip'
+}
+
+$crossControlMethodHeader = [byte[]](@(0x21) +
+    [BitConverter]::GetBytes([int]48) +
+    [BitConverter]::GetBytes([int16]$iextLibraryId))
+$crossControlCanonicalMember = [byte[]](@(0x39) +
+    [BitConverter]::GetBytes([int]36) +
+    [BitConverter]::GetBytes([int]$iextControlTypeId))
+$crossControlLegacyMember = [byte[]](@(0x39) +
+    [BitConverter]::GetBytes([int]36) +
+    [BitConverter]::GetBytes([int]196612))
+$crossControlIds = [Collections.Generic.List[int]]::new()
+foreach ($crossControlUnpacked in @($crossControlUnpacked1, $crossControlUnpacked2)) {
+    $nativeMap = @(Get-Content -LiteralPath (Join-Path $crossControlUnpacked 'project\.native_source_map.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
+    $method = @($nativeMap.methods | Where-Object { $_.name -eq 'ProbeCrossFormControl' })[0]
+    if ($null -eq $method) { throw 'cross-form control native method snapshot missing' }
+    $expression = [Convert]::FromBase64String($method.expressionData)
+    if ((Get-NativeByteSequenceCount $expression $crossControlMethodHeader) -ne 1 -or
+        (Get-NativeByteSequenceCount $expression $crossControlCanonicalMember) -ne 1 -or
+        (Get-NativeByteSequenceCount $expression $crossControlLegacyMember) -ne 0) {
+        throw ('cross-form support member did not use canonical owner type 0x{0:X8}' -f $iextControlTypeId)
+    }
+    $symbolMap = Get-Content -LiteralPath (Join-Path $crossControlUnpacked 'project\.native_symbol_map.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $controlSnapshot = @($symbolMap.forms.elements | Where-Object { $_.name -eq '超级列表框1' })[0]
+    if ($null -eq $controlSnapshot) { throw 'cross-form current control identity missing' }
+    $crossControlIds.Add([int]$controlSnapshot.id)
+}
+if ($crossControlIds.Count -ne 2 -or $crossControlIds[0] -ne $crossControlIds[1]) {
+    throw 'cross-form control id changed during the second roundtrip'
+}
+
 if ($rawHandlerFailureEvidence.Count -ne 9) {
     throw "raw form handler negative evidence count mismatch: $($rawHandlerFailureEvidence.Count)"
 }
@@ -1233,6 +1422,10 @@ $result = [ordered]@{
     form_control_projection_sha256 = (Get-FileHash -LiteralPath $controlSource1 -Algorithm SHA256).Hash.ToLowerInvariant()
     form_control_second_projection_sha256 = (Get-FileHash -LiteralPath $controlSource2 -Algorithm SHA256).Hash.ToLowerInvariant()
     form_control_reference_count = 2
+    cross_form_control_id = ('0x{0:X8}' -f $crossControlIds[0])
+    cross_form_control_owner_type = ('0x{0:X8}' -f $iextControlTypeId)
+    cross_form_control_projection_sha256 = (Get-FileHash -LiteralPath $crossControlSource1 -Algorithm SHA256).Hash.ToLowerInvariant()
+    cross_form_control_second_projection_sha256 = (Get-FileHash -LiteralPath $crossControlSource2 -Algorithm SHA256).Hash.ToLowerInvariant()
     raw_form_handler_id = ('0x{0:X8}' -f $nativeHandlerId)
     raw_form_handler_alias = $rawHandlerAlias
     raw_form_handler_positive_sha256 = (Get-FileHash -LiteralPath $rawHandlerPositive -Algorithm SHA256).Hash.ToLowerInvariant()

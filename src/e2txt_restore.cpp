@@ -2303,21 +2303,25 @@ public:
 	bool TryResolveSupportTypeMember(
 		const std::int32_t typeId,
 		const std::string& rawMemberName,
-		std::int32_t& outMemberId) const
+		std::int32_t& outMemberId,
+		std::int32_t& outOwnerTypeId) const
 	{
 		const std::string memberName = NormalizeTypeName(rawMemberName);
 		if (memberName.empty()) {
 			outMemberId = 0;
+			outOwnerTypeId = 0;
 			return false;
 		}
 		if (const auto typeIt = m_supportTypesById.find(typeId); typeIt != m_supportTypesById.end()) {
 			const auto memberIt = typeIt->second.memberIdsByName.find(memberName);
 			if (memberIt != typeIt->second.memberIdsByName.end()) {
 				outMemberId = memberIt->second;
+				outOwnerTypeId = typeIt->second.typeId;
 				return outMemberId > 0;
 			}
 		}
 		outMemberId = 0;
+		outOwnerTypeId = 0;
 		return false;
 	}
 
@@ -2334,6 +2338,18 @@ private:
 	void RegisterSupportType(const std::string& normalizedName, SupportLibraryTypeInfo info)
 	{
 		info.normalizedName = normalizedName;
+		// Some legacy window-component ids are kept as public-name aliases even when
+		// the loaded support library occupies another project slot. Keep the loaded
+		// type id inside the aliased record so rebuilt member expressions use the
+		// canonical owner type required by that project's dependency order.
+		if (const auto builtinIt = m_builtinTypes.find(normalizedName);
+			builtinIt != m_builtinTypes.end() &&
+			epl_system_id::IsLibDataType(builtinIt->second) &&
+			builtinIt->second != info.typeId &&
+			!m_supportTypesById.contains(builtinIt->second)) {
+			SupportLibraryTypeInfo builtinAlias = info;
+			m_supportTypesById.emplace(builtinIt->second, std::move(builtinAlias));
+		}
 		m_supportTypesById.insert_or_assign(info.typeId, info);
 		m_supportTypes.insert_or_assign(normalizedName, std::move(info));
 	}
@@ -4514,6 +4530,18 @@ bool StartsWithAt(const std::string& text, const size_t offset, const std::strin
 
 bool TryGetNativeTextQuoteLength(const std::string& text, const size_t offset, size_t& outLength)
 {
+	size_t characterOffset = 0;
+	while (characterOffset < offset) {
+		const auto ch = static_cast<unsigned char>(text[characterOffset]);
+		characterOffset +=
+			IsDBCSLeadByteEx(CP_ACP, ch) != FALSE && characterOffset + 1 < text.size()
+				? 2
+				: 1;
+	}
+	if (characterOffset != offset) {
+		outLength = 0;
+		return false;
+	}
 	if (StartsWithAt(text, offset, kTextLiteralLeftQuote)) {
 		outLength = std::strlen(kTextLiteralLeftQuote);
 		return true;
@@ -5015,9 +5043,14 @@ bool TryResolveNativeMember(
 	const std::int32_t supportTypeId =
 		aliasIt == context.supportMemberTypeByOwnerType.end() ? ownerTypeId : aliasIt->second;
 	std::int32_t memberId = 0;
+	std::int32_t memberOwnerTypeId = 0;
 	if (context.typeResolver != nullptr &&
-		context.typeResolver->TryResolveSupportTypeMember(supportTypeId, rawMemberName, memberId)) {
-		outMember = NativeObjectMemberSymbol{ memberId, ownerTypeId, 0 };
+		context.typeResolver->TryResolveSupportTypeMember(
+			supportTypeId,
+			rawMemberName,
+			memberId,
+			memberOwnerTypeId)) {
+		outMember = NativeObjectMemberSymbol{ memberId, memberOwnerTypeId, 0 };
 		return true;
 	}
 
@@ -5424,6 +5457,21 @@ bool TryEncodeNativeOperatorExpression(
 	std::string* outError)
 {
 	std::vector<std::string> parts;
+	const auto encodeBinaryAt = [&](const size_t position, const size_t tokenLength, const std::int32_t methodId) {
+		std::vector<std::string> binaryParts = {
+			TrimAsciiCopy(expression.substr(0, position)),
+			TrimAsciiCopy(expression.substr(position + tokenLength)),
+		};
+		return TryEncodeNativeOperatorCall(
+			methodId,
+			binaryParts,
+			context,
+			writer,
+			methodReferences,
+			variableReferences,
+			constantReferences,
+			outError);
+	};
 	if (TrySplitTopLevelExpressionByToken(expression, "||", parts) && parts.size() > 1) {
 		return TryEncodeNativeOperatorCall(46, parts, context, writer, methodReferences, variableReferences, constantReferences, outError);
 	}
@@ -5446,29 +5494,49 @@ bool TryEncodeNativeOperatorExpression(
 		}
 	}
 
-	if (TrySplitTopLevelExpressionByToken(expression, "+", parts) && parts.size() > 1) {
+	std::vector<size_t> plusPositions;
+	CollectTopLevelOperatorPositions(expression, "+", plusPositions);
+	size_t binaryMinusPos = std::string::npos;
+	const bool hasBinaryMinus = TryFindTopLevelBinaryMinus(expression, binaryMinusPos);
+	if (hasBinaryMinus) {
+		if (!plusPositions.empty() && plusPositions.back() > binaryMinusPos) {
+			return encodeBinaryAt(plusPositions.back(), 1, 19);
+		}
+		return encodeBinaryAt(binaryMinusPos, 1, 20);
+	}
+	if (!plusPositions.empty() &&
+		TrySplitTopLevelExpressionByToken(expression, "+", parts) &&
+		parts.size() > 1) {
 		return TryEncodeNativeOperatorCall(19, parts, context, writer, methodReferences, variableReferences, constantReferences, outError);
 	}
 
-	size_t binaryMinusPos = std::string::npos;
-	if (TryFindTopLevelBinaryMinus(expression, binaryMinusPos)) {
-		std::vector<std::string> minusParts;
-		minusParts.push_back(TrimAsciiCopy(expression.substr(0, binaryMinusPos)));
-		minusParts.push_back(TrimAsciiCopy(expression.substr(binaryMinusPos + 1)));
-		return TryEncodeNativeOperatorCall(20, minusParts, context, writer, methodReferences, variableReferences, constantReferences, outError);
+	std::vector<size_t> multiplyPositions;
+	std::vector<size_t> dividePositions;
+	std::vector<size_t> integerDividePositions;
+	std::vector<size_t> remainderPositions;
+	CollectTopLevelOperatorPositions(expression, "*", multiplyPositions);
+	CollectTopLevelOperatorPositions(expression, "/", dividePositions);
+	CollectTopLevelOperatorPositions(expression, "\\", integerDividePositions);
+	CollectTopLevelOperatorPositions(expression, "%", remainderPositions);
+	if (!dividePositions.empty() || !integerDividePositions.empty() || !remainderPositions.empty()) {
+		size_t rightmostPosition = 0;
+		std::int32_t rightmostMethodId = 15;
+		const auto consider = [&](const std::vector<size_t>& positions, const std::int32_t methodId) {
+			if (!positions.empty() && positions.back() >= rightmostPosition) {
+				rightmostPosition = positions.back();
+				rightmostMethodId = methodId;
+			}
+		};
+		consider(multiplyPositions, 15);
+		consider(dividePositions, 16);
+		consider(integerDividePositions, 17);
+		consider(remainderPositions, 18);
+		return encodeBinaryAt(rightmostPosition, 1, rightmostMethodId);
 	}
-
-	if (TrySplitTopLevelExpressionByToken(expression, "*", parts) && parts.size() > 1) {
+	if (!multiplyPositions.empty() &&
+		TrySplitTopLevelExpressionByToken(expression, "*", parts) &&
+		parts.size() > 1) {
 		return TryEncodeNativeOperatorCall(15, parts, context, writer, methodReferences, variableReferences, constantReferences, outError);
-	}
-	if (TrySplitTopLevelExpressionByToken(expression, "/", parts) && parts.size() > 1) {
-		return TryEncodeNativeOperatorCall(16, parts, context, writer, methodReferences, variableReferences, constantReferences, outError);
-	}
-	if (TrySplitTopLevelExpressionByToken(expression, "\\", parts) && parts.size() > 1) {
-		return TryEncodeNativeOperatorCall(17, parts, context, writer, methodReferences, variableReferences, constantReferences, outError);
-	}
-	if (TrySplitTopLevelExpressionByToken(expression, "%", parts) && parts.size() > 1) {
-		return TryEncodeNativeOperatorCall(18, parts, context, writer, methodReferences, variableReferences, constantReferences, outError);
 	}
 
 	if (!expression.empty() && expression.front() == '-' && IsUnaryMinusContext(expression, 0)) {
@@ -14192,14 +14260,25 @@ bool BuildRestoreModel(
 					resolveTypeIdWithNativeFallback(globalDefinition.typeName, snapshot->dataType));
 			}
 			for (const auto& form : model.forms) {
-				if (form.classId != targetClass.id || form.id == 0) {
+				if (form.id == 0) {
 					continue;
 				}
+
+				// Every form name is a project-wide object expression. Controls are also
+				// members of that form, which is required for references such as
+				// OtherWindow.Control.Property from a different window or assembly.
 				addNativeObjectVariable(form.name, form.id, form.id);
 				nativeObjectEncodeContext.supportMemberTypeByOwnerType.insert_or_assign(form.id, 65537);
-				nativeObjectEncodeContext.implicitSupportTypeId = 65537;
+				const bool isOwningForm = form.classId == targetClass.id;
+				if (isOwningForm) {
+					nativeObjectEncodeContext.implicitSupportTypeId = 65537;
+				}
 				for (const auto& element : form.elements) {
-					if (!element.name.empty() && element.id != 0 && element.dataType != 0) {
+					if (element.name.empty() || element.id == 0 || element.dataType == 0) {
+						continue;
+					}
+					addNativeObjectMember(form.id, element.name, element.id, element.dataType);
+					if (isOwningForm) {
 						addNativeObjectVariable(element.name, element.id, element.dataType);
 					}
 				}
