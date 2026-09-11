@@ -490,6 +490,50 @@ int main()
 			0x49000000,
 			0) == 0x49000000,
 		"a canonical native class ID must preserve its class kind when exported text has a base-class field");
+	check(e2txt::CanReferenceExactNativeStaticClassOwner(
+			0x09010020,
+			"__HIDDEN_TEMP_MOD__",
+			0x09010020,
+			"__HIDDEN_TEMP_MOD__",
+			true,
+			true) &&
+		e2txt::CanReferenceExactNativeStaticClassOwner(
+			0x09010020,
+			"__HIDDEN_TEMP_MOD__",
+			0x09010020,
+			"__HIDDEN_TEMP_MOD__",
+			true,
+			true),
+		"two dependencies may reference one exact shared static owner without creating another class slot");
+	check(!e2txt::CanReferenceExactNativeStaticClassOwner(
+			0x49010020,
+			"SharedOwner",
+			0x49010020,
+			"SharedOwner",
+			true,
+			true) &&
+		!e2txt::CanReferenceExactNativeStaticClassOwner(
+			0x09010020,
+			"SharedOwner",
+			0x09010021,
+			"SharedOwner",
+			true,
+			true) &&
+		!e2txt::CanReferenceExactNativeStaticClassOwner(
+			0x09010020,
+			"SharedOwner",
+			0x09010020,
+			"DifferentOwner",
+			true,
+			true) &&
+		!e2txt::CanReferenceExactNativeStaticClassOwner(
+			0x09010020,
+			"SharedOwner",
+			0x09010020,
+			"SharedOwner",
+			true,
+			false),
+		"shared-owner reuse must fail closed on category, ID, name, or member-evidence drift");
 	std::vector<std::int32_t> stableEmissionOrder;
 	check(e2txt::TryBuildNativeDependencyEmissionOrder(
 			std::vector<std::int32_t>{0x41010002, 0x41010003, 0x41020001, 0x41010001},

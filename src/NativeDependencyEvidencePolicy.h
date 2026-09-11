@@ -296,6 +296,26 @@ inline std::int32_t SelectNativeDependencyClassType(
 	return parsedClassType;
 }
 
+// A dependency may own methods whose compiler-generated static owner is stored
+// in another dependency's class range. Reuse that page only with a complete,
+// unique native snapshot and an exact owner ID/category/name relation. The
+// caller remains responsible for checking the snapshot's member identities.
+inline bool CanReferenceExactNativeStaticClassOwner(
+	const std::int32_t classId,
+	const std::string& normalizedClassName,
+	const std::int32_t methodOwnerClassId,
+	const std::string& normalizedMethodOwnerName,
+	const bool ownerEvidenceUnique,
+	const bool memberEvidenceComplete)
+{
+	constexpr std::int32_t kTypeMask = static_cast<std::int32_t>(0xFF000000u);
+	constexpr std::int32_t kStaticClassType = 0x09000000;
+	return ownerEvidenceUnique && memberEvidenceComplete && classId != 0 &&
+		(classId & kTypeMask) == kStaticClassType && classId == methodOwnerClassId &&
+		!normalizedClassName.empty() &&
+		(normalizedMethodOwnerName.empty() || normalizedClassName == normalizedMethodOwnerName);
+}
+
 // Overlapping ordered slices can be created by re-exported dependencies. A
 // sole candidate owns the symbol. With overlap, an exact range start is the
 // strongest evidence; otherwise exactly one direct (non-re-export) record must

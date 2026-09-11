@@ -1,4 +1,4 @@
-#include "e2txt.h"
+﻿#include "e2txt.h"
 
 #include <Windows.h>
 
@@ -102,6 +102,10 @@ struct RestoreDependencyInfo {
 	bool isSupportLibrary = false;
 	std::vector<DefinedIdRange> definedIds;
 	std::vector<NativeDependencyClassSymbol> nativeClasses;
+	// Exact static owners referenced by this dependency's native methods but
+	// owned by another dependency range. They authorize binding to one existing
+	// class page; they are not additional defined-id slots for this dependency.
+	std::vector<NativeDependencyClassSymbol> nativeReferencedClasses;
 	std::vector<NativeDependencyGlobalSymbol> nativeGlobals;
 	std::vector<NativeDependencyStructSymbol> nativeStructs;
 	std::vector<NativeDependencyDllSymbol> nativeDlls;
@@ -10947,31 +10951,59 @@ bool BuildRestoreModel(
 	// the program-header high-water mark. No numeric adjacency or name-only claim is
 	// permitted here.
 	std::unordered_map<std::int32_t, NativeDependencyClassSymbol> exactOwnerEvidenceById;
+	std::unordered_map<std::int32_t, size_t> exactOwnerDependencyById;
 	std::unordered_set<std::int32_t> ambiguousExactOwnerEvidenceIds;
-	const auto registerExactOwnerEvidence = [&](const NativeDependencyClassSymbol& candidate) {
+	const auto hasSameNativeClassEvidence = [&](const NativeDependencyClassSymbol& left,
+		const NativeDependencyClassSymbol& right) {
+		if (left.id != right.id || left.memoryAddress != right.memoryAddress ||
+			left.formId != right.formId || left.baseClass != right.baseClass ||
+			TypeResolver::NormalizeTypeName(left.name) != TypeResolver::NormalizeTypeName(right.name) ||
+			left.functionIds != right.functionIds || left.variables.size() != right.variables.size()) {
+			return false;
+		}
+		for (size_t index = 0; index < left.variables.size(); ++index) {
+			const auto& leftVariable = left.variables[index];
+			const auto& rightVariable = right.variables[index];
+			if (leftVariable.id != rightVariable.id ||
+				leftVariable.dataType != rightVariable.dataType ||
+				leftVariable.attr != rightVariable.attr ||
+				TypeResolver::NormalizeTypeName(leftVariable.name) !=
+					TypeResolver::NormalizeTypeName(rightVariable.name) ||
+				leftVariable.comment != rightVariable.comment ||
+				leftVariable.arrayBounds != rightVariable.arrayBounds) {
+				return false;
+			}
+		}
+		return true;
+	};
+	const size_t unassignedOwnerDependency = (std::numeric_limits<size_t>::max)();
+	const auto registerExactOwnerEvidence = [&](const NativeDependencyClassSymbol& candidate,
+		const size_t ownerDependencyIndex) {
 		if (candidate.id == 0 || ambiguousExactOwnerEvidenceIds.contains(candidate.id)) {
 			return;
 		}
 		const auto existing = exactOwnerEvidenceById.find(candidate.id);
 		if (existing == exactOwnerEvidenceById.end()) {
 			exactOwnerEvidenceById.emplace(candidate.id, candidate);
+			exactOwnerDependencyById.insert_or_assign(candidate.id, ownerDependencyIndex);
 			return;
 		}
-		if (TypeResolver::NormalizeTypeName(existing->second.name) !=
-				TypeResolver::NormalizeTypeName(candidate.name)) {
+		if (!hasSameNativeClassEvidence(existing->second, candidate)) {
 			exactOwnerEvidenceById.erase(existing);
+			exactOwnerDependencyById.erase(candidate.id);
 			ambiguousExactOwnerEvidenceIds.insert(candidate.id);
 		}
 	};
-	for (const auto& dependency : model.dependencies) {
+	for (size_t dependencyIndex = 0; dependencyIndex < model.dependencies.size(); ++dependencyIndex) {
+		const auto& dependency = model.dependencies[dependencyIndex];
 		if (!dependency.isSupportLibrary) {
 			for (const auto& candidate : dependency.nativeClasses) {
-				registerExactOwnerEvidence(candidate);
+				registerExactOwnerEvidence(candidate, dependencyIndex);
 			}
 		}
 	}
 	for (const auto& candidate : unassignedDependencySymbols.classes) {
-		registerExactOwnerEvidence(candidate);
+		registerExactOwnerEvidence(candidate, unassignedOwnerDependency);
 	}
 	for (size_t dependencyIndex = 0; dependencyIndex < model.dependencies.size(); ++dependencyIndex) {
 		auto& dependency = model.dependencies[dependencyIndex];
@@ -10989,11 +11021,8 @@ bool BuildRestoreModel(
 				continue;
 			}
 			const NativeDependencyClassSymbol* uniqueOwner = &ownerEvidence->second;
+			const std::string ownerName = TypeResolver::NormalizeTypeName(uniqueOwner->name);
 			const std::string methodOwnerName = TypeResolver::NormalizeTypeName(method.ownerClassName);
-			if (!methodOwnerName.empty() &&
-				TypeResolver::NormalizeTypeName(uniqueOwner->name) != methodOwnerName) {
-				continue;
-			}
 			std::vector<std::int32_t> ownedIds{ uniqueOwner->id };
 			bool completeOwnerEvidence = true;
 			for (const auto& variable : uniqueOwner->variables) {
@@ -11002,6 +11031,45 @@ bool BuildRestoreModel(
 					break;
 				}
 				ownedIds.push_back(variable.id);
+			}
+			const auto nativeOwnerDependency = exactOwnerDependencyById.find(uniqueOwner->id);
+			const bool ownedByEarlierDependency =
+				nativeOwnerDependency != exactOwnerDependencyById.end() &&
+				nativeOwnerDependency->second != unassignedOwnerDependency &&
+				nativeOwnerDependency->second < dependencyIndex;
+			if (ownedByEarlierDependency) {
+				const bool hasDifferentOwnedClassWithSameName = std::any_of(
+					dependency.nativeClasses.begin(),
+					dependency.nativeClasses.end(),
+					[&](const NativeDependencyClassSymbol& item) {
+						return item.id != uniqueOwner->id &&
+							TypeResolver::NormalizeTypeName(item.name) == ownerName;
+					});
+				if (hasDifferentOwnedClassWithSameName) {
+					continue;
+				}
+				const std::unordered_set<std::int32_t> noClaimedIds;
+				if (!CanReferenceExactNativeStaticClassOwner(
+					uniqueOwner->id,
+					ownerName,
+					method.ownerClassId,
+					methodOwnerName,
+					!ambiguousExactOwnerEvidenceIds.contains(uniqueOwner->id),
+					completeOwnerEvidence) ||
+					!AreNativeEvidenceIdsAvailable(
+						ownedIds,
+						occupiedNativeEvidenceIds,
+						noClaimedIds)) {
+					continue;
+				}
+				if (std::none_of(
+					dependency.nativeReferencedClasses.begin(),
+					dependency.nativeReferencedClasses.end(),
+					[&](const NativeDependencyClassSymbol& item) { return item.id == uniqueOwner->id; })) {
+					dependency.nativeReferencedClasses.push_back(*uniqueOwner);
+				}
+				registerNativeTypeName(uniqueOwner->id, uniqueOwner->name);
+				continue;
 			}
 			if (!completeOwnerEvidence ||
 				!AreNativeEvidenceIdsAvailable(
@@ -11412,6 +11480,40 @@ bool BuildRestoreModel(
 		if (dependencyLoaded) {
 			dependencyBundle = loadedPublicDependencyBundles[dependencyIndex];
 		}
+		const auto findReferencedNativeClassIndex = [&](const NativeDependencyClassSymbol& evidence)
+			-> std::optional<size_t> {
+			std::optional<size_t> match;
+			for (size_t classIndex = 0; classIndex < model.classes.size(); ++classIndex) {
+				const auto& candidate = model.classes[classIndex];
+				if (candidate.id != evidence.id) {
+					continue;
+				}
+				if (match.has_value() ||
+					epl_system_id::GetType(candidate.id) != epl_system_id::kTypeStaticClass ||
+					candidate.memoryAddress != evidence.memoryAddress ||
+					candidate.baseClass != evidence.baseClass ||
+					TypeResolver::NormalizeTypeName(candidate.name) !=
+						TypeResolver::NormalizeTypeName(evidence.name) ||
+					candidate.vars.size() != evidence.variables.size()) {
+					return std::nullopt;
+				}
+				for (size_t variableIndex = 0; variableIndex < candidate.vars.size(); ++variableIndex) {
+					const auto& candidateVariable = candidate.vars[variableIndex];
+					const auto& evidenceVariable = evidence.variables[variableIndex];
+					if (candidateVariable.id != evidenceVariable.id ||
+						candidateVariable.dataType != evidenceVariable.dataType ||
+						candidateVariable.attr != evidenceVariable.attr ||
+						TypeResolver::NormalizeTypeName(candidateVariable.name) !=
+							TypeResolver::NormalizeTypeName(evidenceVariable.name) ||
+						candidateVariable.comment != evidenceVariable.comment ||
+						candidateVariable.arrayBounds != evidenceVariable.arrayBounds) {
+						return std::nullopt;
+					}
+				}
+				match = classIndex;
+			}
+			return match;
+		};
 		if (!dependencyLoaded) {
 			if (!dependency.nativeClasses.empty() || !dependency.nativeGlobals.empty() ||
 				!dependency.nativeStructs.empty() || !dependency.nativeDlls.empty() ||
@@ -11426,6 +11528,20 @@ bool BuildRestoreModel(
 
 				std::unordered_map<std::int32_t, size_t> classIndexById;
 				std::unordered_map<std::string, size_t> classIndexByName;
+				for (const auto& referencedClass : dependency.nativeReferencedClasses) {
+					const auto referencedIndex = findReferencedNativeClassIndex(referencedClass);
+					if (!referencedIndex.has_value()) {
+						if (outError != nullptr) {
+							*outError = "dependency_referenced_native_class_evidence_mismatch: " +
+								dependency.name + " class=" + referencedClass.name;
+						}
+						return false;
+					}
+					classIndexById.insert_or_assign(referencedClass.id, *referencedIndex);
+					classIndexByName.insert_or_assign(
+						TypeResolver::NormalizeTypeName(referencedClass.name),
+						*referencedIndex);
+				}
 				const auto addNativeOnlyClass = [&](const std::int32_t preferredId, const std::string& rawName, const std::int32_t memoryAddress, const std::int32_t baseClass) -> size_t {
 					if (preferredId != 0) {
 						if (const auto it = classIndexById.find(preferredId); it != classIndexById.end()) {
@@ -12107,6 +12223,24 @@ bool BuildRestoreModel(
 			nativeClassBindings[className].baseClass = classSymbol.baseClass;
 			nativeClassBindings[className].symbol = &classSymbol;
 		}
+		for (const auto& classSymbol : dependency.nativeReferencedClasses) {
+			const std::string className = TypeResolver::NormalizeTypeName(classSymbol.name);
+			if (className.empty()) {
+				continue;
+			}
+			auto& binding = nativeClassBindings[className];
+			if (binding.classId != 0 && binding.classId != classSymbol.id) {
+				if (outError != nullptr) {
+					*outError = "dependency_referenced_native_class_name_conflict: " +
+						dependency.name + " class=" + classSymbol.name;
+				}
+				return false;
+			}
+			binding.classId = classSymbol.id;
+			binding.memoryAddress = classSymbol.memoryAddress;
+			binding.baseClass = classSymbol.baseClass;
+			binding.symbol = &classSymbol;
+		}
 		for (const auto& methodSymbol : dependency.nativeMethods) {
 			const std::string methodName = TypeResolver::NormalizeTypeName(methodSymbol.name);
 			if (methodName.empty()) {
@@ -12285,6 +12419,18 @@ bool BuildRestoreModel(
 
 		std::unordered_map<std::string, size_t> importedClassModelIndices;
 		std::vector<std::pair<std::string, size_t>> importedClassModelOrder;
+		std::unordered_map<std::int32_t, size_t> referencedClassModelIndices;
+		for (const auto& referencedClass : dependency.nativeReferencedClasses) {
+			const auto referencedIndex = findReferencedNativeClassIndex(referencedClass);
+			if (!referencedIndex.has_value()) {
+				if (outError != nullptr) {
+					*outError = "dependency_referenced_native_class_evidence_mismatch: " +
+						dependency.name + " class=" + referencedClass.name;
+				}
+				return false;
+			}
+			referencedClassModelIndices.insert_or_assign(referencedClass.id, *referencedIndex);
+		}
 		size_t hiddenTempClassIndex = (std::numeric_limits<size_t>::max)();
 		const size_t dependencyClassModelStart = model.classes.size();
 		definedIdsForSection.clear();
@@ -12494,6 +12640,14 @@ bool BuildRestoreModel(
 				}
 				importedClassModelIndices.insert_or_assign(normalizedName, index);
 				importedClassModelOrder.emplace_back(normalizedName, index);
+			}
+			for (const auto& [classId, modelIndex] : referencedClassModelIndices) {
+				const std::string normalizedName = TypeResolver::NormalizeTypeName(model.classes[modelIndex].name);
+				if (normalizedName == hiddenTempName) {
+					hiddenTempClassIndex = modelIndex;
+				}
+				importedClassModelIndices.insert_or_assign(normalizedName, modelIndex);
+				importedClassModelOrder.emplace_back(normalizedName, modelIndex);
 			}
 		}
 		if (!preserveDefinedIds) {
