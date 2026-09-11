@@ -11931,8 +11931,19 @@ bool BuildRestoreModel(
 			}
 			return unique;
 		};
+		const auto findCanonicalDependencyDllSnapshot = [&](const ParsedDllDef& parsed)
+			-> const BundleNativeDllSnapshot* {
+			return SelectUniqueCanonicalDependencyDllSnapshot(
+				dependencyBundle.nativeDllSnapshots,
+				TypeResolver::NormalizeTypeName(parsed.name),
+				ComputeParsedDllDigest(parsed),
+				parsed.params.size(),
+				[](const std::string& name) { return TypeResolver::NormalizeTypeName(name); });
+		};
 		const auto findImportedDllSymbol = [&](const ParsedDllDef& parsed)
 			-> const NativeDependencyDllSymbol* {
+			const BundleNativeDllSnapshot* canonicalSnapshot =
+				findCanonicalDependencyDllSnapshot(parsed);
 			const NativeDependencyDllSymbol* unique = nullptr;
 			for (const auto& symbol : dependency.nativeDlls) {
 				if (TypeResolver::NormalizeTypeName(parsed.name) !=
@@ -11941,14 +11952,22 @@ bool BuildRestoreModel(
 						NormalizeDependencyMatchText(symbol.fileName) ||
 					TypeResolver::NormalizeTypeName(parsed.commandName) !=
 						TypeResolver::NormalizeTypeName(symbol.commandName) ||
-					!nativeTypeMatchesForImport(parsed.returnTypeName, symbol.returnType) ||
+					!nativeTypeMatchesForImport(
+						parsed.returnTypeName,
+						symbol.returnType,
+						canonicalSnapshot != nullptr ? canonicalSnapshot->returnType : 0) ||
 					parsed.params.size() != symbol.params.size()) {
 					continue;
 				}
 				bool paramsMatch = true;
 				for (size_t paramIndex = 0; paramIndex < parsed.params.size(); ++paramIndex) {
 					if (!nativeVariableDeclarationMatches(
-							parsed.params[paramIndex], symbol.params[paramIndex], false)) {
+							parsed.params[paramIndex],
+							symbol.params[paramIndex],
+							false,
+							canonicalSnapshot != nullptr
+								? canonicalSnapshot->paramTypes[paramIndex]
+								: 0)) {
 						paramsMatch = false;
 						break;
 					}
@@ -12267,29 +12286,54 @@ bool BuildRestoreModel(
 		std::unordered_map<std::string, size_t> importedClassModelIndices;
 		std::vector<std::pair<std::string, size_t>> importedClassModelOrder;
 		size_t hiddenTempClassIndex = (std::numeric_limits<size_t>::max)();
+		const size_t dependencyClassModelStart = model.classes.size();
 		definedIdsForSection.clear();
 		const auto hiddenNativeIt = nativeClassBindings.find(
 			TypeResolver::NormalizeTypeName("__HIDDEN_TEMP_MOD__"));
 		const DependencyNativeClassBinding* hiddenNative =
 			hiddenNativeIt == nativeClassBindings.end() ? nullptr : &hiddenNativeIt->second;
 		const std::int32_t hiddenNativeClassId = hiddenNative != nullptr ? hiddenNative->classId : 0;
-		const bool hiddenNativeIsReferenced = hiddenNativeClassId != 0 && std::any_of(
-			dependency.nativeMethods.begin(), dependency.nativeMethods.end(),
-			[&](const NativeDependencyMethodSymbol& method) {
-				return method.ownerClassId == hiddenNativeClassId;
-			});
-		const bool hiddenNativeIsRangeStart = hiddenNativeClassId != 0 && std::any_of(
-			dependency.definedIds.begin(), dependency.definedIds.end(),
-			[&](const RestoreDependencyInfo::DefinedIdRange& range) {
-				return range.start == hiddenNativeClassId;
-			});
+		const auto appendNativeClassVariables = [&](const NativeDependencyClassSymbol* nativeClass,
+			RestoreClass& target,
+			const std::string& className) -> bool {
+			if (nativeClass == nullptr || nativeClass->variables.empty()) {
+				return true;
+			}
+			if (!nativeClassesWithReservedChildEvidence.contains(nativeClass->id)) {
+				if (outError != nullptr) {
+					*outError = "dependency_native_class_variable_identity_incomplete: " +
+						dependency.name + " class=" + className;
+				}
+				return false;
+			}
+			for (const auto& nativeVariable : nativeClass->variables) {
+				const std::int32_t variableId = dependencyIds.AllocChild(
+					allocator,
+					epl_system_id::kTypeClassMember,
+					nativeVariable.id);
+				if (variableId == 0) {
+					if (outError != nullptr) {
+						*outError = "dependency_native_class_variable_id_conflict: " +
+							dependency.name + " class=" + className;
+					}
+					return false;
+				}
+				RestoreVariable variable;
+				variable.id = variableId;
+				variable.dataType = nativeVariable.dataType;
+				variable.attr = nativeVariable.attr;
+				variable.name = nativeVariable.name;
+				variable.comment = nativeVariable.comment;
+				variable.arrayBounds = nativeVariable.arrayBounds;
+				target.vars.push_back(std::move(variable));
+			}
+			return true;
+		};
 		// Existing dependencies must not gain an unconditional synthetic owner: it
 		// sits outside definedIds in native EC files and would receive a fresh ID on
-		// every roundtrip. Exact native owner evidence is recovered above from
-		// method.ownerClassId. New imports still get a helper when needed.
-		if ((importedNativeClassIds.contains(hiddenNativeClassId) &&
-				(hiddenNativeIsReferenced || hiddenNativeIsRangeStart)) ||
-			!preserveDefinedIds) {
+		// every roundtrip. Range-owned native classes are restored below in their
+		// canonical slots. New imports still get a helper when needed.
+		if (!preserveDefinedIds) {
 			RestoreClass hiddenTemp;
 			if (importedNativeClassIds.contains(hiddenNativeClassId)) {
 				hiddenTemp.id = dependencyIds.AllocTopLevelFromImportedSymbol(
@@ -12310,6 +12354,12 @@ bool BuildRestoreModel(
 				hiddenTemp.baseClass = hiddenNative->baseClass;
 			}
 			hiddenTemp.isHidden = true;
+			if (!appendNativeClassVariables(
+					hiddenNative != nullptr ? hiddenNative->symbol : nullptr,
+					hiddenTemp,
+				hiddenTemp.name)) {
+				return false;
+			}
 			hiddenTempClassIndex = model.classes.size();
 			model.classes.push_back(std::move(hiddenTemp));
 			definedIdsForSection.push_back(model.classes.back().id);
@@ -12348,36 +12398,11 @@ bool BuildRestoreModel(
 			item.comment = parsedClass.comment;
 			item.baseClass = nativeClass != nullptr ? nativeClass->baseClass : -1;
 			item.isHidden = true;
-			if (nativeClass != nullptr && nativeClass->symbol != nullptr &&
-				!nativeClass->symbol->variables.empty()) {
-				if (!nativeClassesWithReservedChildEvidence.contains(nativeClass->symbol->id)) {
-					if (outError != nullptr) {
-						*outError = "dependency_native_class_variable_identity_incomplete: " +
-							dependency.name + " class=" + parsedClass.name;
-					}
-					return false;
-				}
-				for (const auto& nativeVariable : nativeClass->symbol->variables) {
-					const std::int32_t variableId = dependencyIds.AllocChild(
-						allocator,
-						epl_system_id::kTypeClassMember,
-						nativeVariable.id);
-					if (variableId == 0) {
-						if (outError != nullptr) {
-							*outError = "dependency_native_class_variable_id_conflict: " +
-								dependency.name + " class=" + parsedClass.name;
-						}
-						return false;
-					}
-					RestoreVariable variable;
-					variable.id = variableId;
-					variable.dataType = nativeVariable.dataType;
-					variable.attr = nativeVariable.attr;
-					variable.name = nativeVariable.name;
-					variable.comment = nativeVariable.comment;
-					variable.arrayBounds = nativeVariable.arrayBounds;
-					item.vars.push_back(std::move(variable));
-				}
+			if (!appendNativeClassVariables(
+					nativeClass != nullptr ? nativeClass->symbol : nullptr,
+					item,
+					parsedClass.name)) {
+				return false;
 			}
 			const std::string normalizedClassName = TypeResolver::NormalizeTypeName(parsedClass.name);
 			importedClassModelIndices.insert_or_assign(normalizedClassName, model.classes.size());
@@ -12385,6 +12410,91 @@ bool BuildRestoreModel(
 			model.classes.push_back(std::move(item));
 			resolver.RegisterUserType(parsedClass.name, model.classes.back().id);
 			definedIdsForSection.push_back(model.classes.back().id);
+		}
+		if (preserveDefinedIds) {
+			// Public EC headers can omit a private helper class even though that class
+			// occupies a dependency range slot. Preserve every trusted native slot and
+			// restore the category-table order so the range cannot spill into local
+			// classes that follow this dependency.
+			for (const auto& nativeClass : dependency.nativeClasses) {
+				if (nativeClass.id == 0 || selectedImportedClassIds.contains(nativeClass.id)) {
+					continue;
+				}
+				if (TypeResolver::NormalizeTypeName(nativeClass.name).empty()) {
+					if (outError != nullptr) {
+						*outError = "dependency_native_class_name_missing: " + dependency.name +
+							" id=" + std::to_string(nativeClass.id);
+					}
+					return false;
+				}
+				RestoreClass item;
+				item.id = dependencyIds.AllocTopLevelFromImportedSymbol(
+					allocator,
+					SelectNativeDependencyClassType(epl_system_id::kTypeStaticClass, nativeClass.id),
+					nativeClass.id);
+				if (item.id == 0) {
+					if (outError != nullptr) {
+						*outError = "dependency_native_class_id_conflict: " + dependency.name +
+							" class=" + nativeClass.name;
+					}
+					return false;
+				}
+				item.memoryAddress = nativeClass.memoryAddress;
+				item.name = nativeClass.name;
+				item.baseClass = nativeClass.baseClass;
+				item.isHidden = true;
+				if (!appendNativeClassVariables(&nativeClass, item, item.name)) {
+					return false;
+				}
+				selectedImportedClassIds.insert(item.id);
+				model.classes.push_back(std::move(item));
+				resolver.RegisterUserType(model.classes.back().name, model.classes.back().id);
+				definedIdsForSection.push_back(model.classes.back().id);
+			}
+
+			std::vector<std::int32_t> emittedClassIds;
+			emittedClassIds.reserve(model.classes.size() - dependencyClassModelStart);
+			for (size_t index = dependencyClassModelStart; index < model.classes.size(); ++index) {
+				emittedClassIds.push_back(model.classes[index].id);
+			}
+			std::vector<std::int32_t> canonicalClassIds;
+			canonicalClassIds.reserve(dependency.nativeClasses.size());
+			for (const auto& nativeClass : dependency.nativeClasses) {
+				canonicalClassIds.push_back(nativeClass.id);
+			}
+			std::vector<size_t> canonicalOrder;
+			if (!BuildExactNativeDependencyItemOrder(
+					emittedClassIds,
+					canonicalClassIds,
+					canonicalOrder)) {
+				if (outError != nullptr) {
+					*outError = "dependency_native_class_slot_order_incomplete: " + dependency.name +
+						" emitted=" + std::to_string(emittedClassIds.size()) +
+						" canonical=" + std::to_string(canonicalClassIds.size());
+				}
+				return false;
+			}
+			std::vector<RestoreClass> orderedClasses;
+			orderedClasses.reserve(canonicalOrder.size());
+			for (const size_t relativeIndex : canonicalOrder) {
+				orderedClasses.push_back(std::move(model.classes[dependencyClassModelStart + relativeIndex]));
+			}
+			for (size_t index = 0; index < orderedClasses.size(); ++index) {
+				model.classes[dependencyClassModelStart + index] = std::move(orderedClasses[index]);
+			}
+
+			importedClassModelIndices.clear();
+			importedClassModelOrder.clear();
+			hiddenTempClassIndex = (std::numeric_limits<size_t>::max)();
+			const std::string hiddenTempName = TypeResolver::NormalizeTypeName("__HIDDEN_TEMP_MOD__");
+			for (size_t index = dependencyClassModelStart; index < model.classes.size(); ++index) {
+				const std::string normalizedName = TypeResolver::NormalizeTypeName(model.classes[index].name);
+				if (normalizedName == hiddenTempName) {
+					hiddenTempClassIndex = index;
+				}
+				importedClassModelIndices.insert_or_assign(normalizedName, index);
+				importedClassModelOrder.emplace_back(normalizedName, index);
+			}
 		}
 		if (!preserveDefinedIds) {
 			appendDefinedIdRanges(dependency, definedIdsForSection);

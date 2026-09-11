@@ -228,6 +228,41 @@ int main()
 		0x41012F83,
 		std::optional<std::string>("AnonymousType141")),
 		"opaque host and canonical dependency types must remain in the same user-type category");
+	struct CanonicalDllProbe {
+		std::string name;
+		std::string textDigest;
+		std::vector<std::int32_t> paramTypes;
+	};
+	std::vector<CanonicalDllProbe> canonicalDlls = {
+		{"CopyPayload", "EXACT", {0x41012F83, -2147482879}},
+		{"CopyPayload", "CHANGED", {0x41012F83, -2147482879}},
+	};
+	const auto normalizeProbeName = [](const std::string& name) { return name; };
+	check(e2txt::SelectUniqueCanonicalDependencyDllSnapshot(
+		canonicalDlls, "CopyPayload", "EXACT", 2, normalizeProbeName) == &canonicalDlls[0],
+		"one exact DLL declaration snapshot must provide canonical parameter type slots");
+	canonicalDlls.push_back(canonicalDlls[0]);
+	check(e2txt::SelectUniqueCanonicalDependencyDllSnapshot(
+		canonicalDlls, "CopyPayload", "EXACT", 2, normalizeProbeName) == nullptr &&
+		e2txt::SelectUniqueCanonicalDependencyDllSnapshot(
+			canonicalDlls, "CopyPayload", "EXACT", 1, normalizeProbeName) == nullptr,
+		"duplicate or shape-mismatched DLL snapshots must fail closed");
+	std::vector<size_t> dependencyItemOrder;
+	check(e2txt::BuildExactNativeDependencyItemOrder(
+		{ 0x09000103, 0x49000101, 0x49000102 },
+		{ 0x49000101, 0x49000102, 0x09000103 },
+		dependencyItemOrder) &&
+		dependencyItemOrder == std::vector<size_t>({ 1, 2, 0 }),
+		"dependency items must follow the canonical native category-table order");
+	check(!e2txt::BuildExactNativeDependencyItemOrder(
+		{ 0x49000101, 0x49000102 },
+		{ 0x49000101, 0x49000102, 0x09000103 },
+		dependencyItemOrder) &&
+		!e2txt::BuildExactNativeDependencyItemOrder(
+			{ 0x49000101, 0x49000101, 0x09000103 },
+			{ 0x49000101, 0x49000102, 0x09000103 },
+			dependencyItemOrder),
+		"missing or duplicate dependency slots must fail before they can consume a local item");
 	const std::unordered_set<std::int32_t> unstableMemberIds = {0x42092C44};
 	const std::vector<std::uint8_t> realVariableReference = {
 		0x1D, 0x38, 0x44, 0x2C, 0x09, 0x42, 0x37,

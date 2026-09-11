@@ -208,6 +208,67 @@ inline bool DoesCanonicalDependencyImportedTypeMatch(
 	return hostCategory != 0 && hostCategory == normalizeUserType(canonicalNativeType);
 }
 
+// A loaded EC has its own native ID space. Select a DLL declaration snapshot
+// only when the public text declaration still matches one unique native slot;
+// callers can then use its return/parameter type IDs as canonical type-name
+// evidence when the host stores an opaque, translated user-type ID.
+template <typename Snapshot, typename NormalizeName>
+const Snapshot* SelectUniqueCanonicalDependencyDllSnapshot(
+	const std::vector<Snapshot>& snapshots,
+	const std::string& normalizedName,
+	const std::string& declarationDigest,
+	const size_t parameterCount,
+	NormalizeName&& normalizeName)
+{
+	const Snapshot* unique = nullptr;
+	for (const auto& candidate : snapshots) {
+		if (normalizeName(candidate.name) != normalizedName ||
+			candidate.textDigest != declarationDigest ||
+			candidate.paramTypes.size() != parameterCount) {
+			continue;
+		}
+		if (unique != nullptr) {
+			return nullptr;
+		}
+		unique = &candidate;
+	}
+	return unique;
+}
+
+// Dependency ranges are offsets into the native category table rather than
+// numeric-ID intervals.  Restored imported items must therefore keep the exact
+// canonical slot order; otherwise a short/reordered import can consume the
+// first local item that follows the dependency.
+inline bool BuildExactNativeDependencyItemOrder(
+	const std::vector<std::int32_t>& emittedIds,
+	const std::vector<std::int32_t>& canonicalIds,
+	std::vector<size_t>& outOrder)
+{
+	outOrder.clear();
+	if (emittedIds.size() != canonicalIds.size()) {
+		return false;
+	}
+	std::unordered_map<std::int32_t, size_t> emittedIndexById;
+	emittedIndexById.reserve(emittedIds.size());
+	for (size_t index = 0; index < emittedIds.size(); ++index) {
+		if (emittedIds[index] == 0 || !emittedIndexById.emplace(emittedIds[index], index).second) {
+			return false;
+		}
+	}
+	outOrder.reserve(canonicalIds.size());
+	std::unordered_set<std::int32_t> canonicalIdsSeen;
+	canonicalIdsSeen.reserve(canonicalIds.size());
+	for (const std::int32_t id : canonicalIds) {
+		const auto it = emittedIndexById.find(id);
+		if (id == 0 || it == emittedIndexById.end() || !canonicalIdsSeen.insert(id).second) {
+			outOrder.clear();
+			return false;
+		}
+		outOrder.push_back(it->second);
+	}
+	return true;
+}
+
 struct NativeDependencyRangeEvidence {
 	std::int32_t start = 0;
 	std::int32_t count = 0;
