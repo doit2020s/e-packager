@@ -150,6 +150,34 @@ int main()
 		});
 	check(duplicatePaths.size() == 1 && duplicatePaths[0] == missing,
 		"duplicate native records with the same exact path must fail closed");
+	const auto storedTokenMatches = e2txt::MatchNativeDependencyRecordsMutuallyUnique(
+		std::vector<e2txt::NativeDependencyMatchKey>{
+			{"jadeview", "c:\\installed\\jadeview.ec", "$jadeview.ec"},
+		},
+		std::vector<e2txt::NativeDependencyMatchKey>{
+			{"jadeview", "c:\\project\\$jadeview.ec", "$jadeview.ec"},
+		});
+	check(storedTokenMatches.size() == 1 && storedTokenMatches[0] == 0,
+		"an exact persisted module token must bind native evidence before resolved-path drift");
+	const auto conflictingStoredTokens = e2txt::MatchNativeDependencyRecordsMutuallyUnique(
+		std::vector<e2txt::NativeDependencyMatchKey>{
+			{"jadeview", "c:\\installed\\first.ec", "$first.ec"},
+		},
+		std::vector<e2txt::NativeDependencyMatchKey>{
+			{"jadeview", "c:\\installed\\second.ec", "$second.ec"},
+		});
+	check(conflictingStoredTokens.size() == 1 && conflictingStoredTokens[0] == missing,
+		"a shared name must not override conflicting resolved and persisted paths");
+	const auto duplicateStoredTokens = e2txt::MatchNativeDependencyRecordsMutuallyUnique(
+		std::vector<e2txt::NativeDependencyMatchKey>{
+			{"jadeview", "c:\\installed\\jadeview.ec", "$jadeview.ec"},
+		},
+		std::vector<e2txt::NativeDependencyMatchKey>{
+			{"jadeview", "c:\\first\\$jadeview.ec", "$jadeview.ec"},
+			{"jadeview", "c:\\second\\$jadeview.ec", "$jadeview.ec"},
+		});
+	check(duplicateStoredTokens.size() == 1 && duplicateStoredTokens[0] == missing,
+		"duplicate native records with the same persisted module token must fail closed");
 	const auto reverseAmbiguity = e2txt::MatchNativeDependencyRecordsMutuallyUnique(
 		std::vector<e2txt::NativeDependencyMatchKey>{
 			{"", "c:\\mods\\same.ec"},

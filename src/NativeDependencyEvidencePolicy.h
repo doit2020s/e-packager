@@ -44,11 +44,13 @@ const Symbol* SelectUniqueUnassignedNativeDependencySymbol(
 struct NativeDependencyMatchKey {
 	std::string name;
 	std::string path;
+	std::string storedPath;
 };
 
 // Match editable dependency rows to records parsed from the preserved native
-// section without making the result depend on row order. Exact non-empty paths
-// win; a name-only fallback is allowed only when at least one path is absent.
+// section without making the result depend on row order. Exact resolved paths
+// win, followed by an exact persisted path token such as "$Module.ec". A
+// name-only fallback is allowed only when at least one side has no path evidence.
 inline std::vector<size_t> MatchNativeDependencyRecordsMutuallyUnique(
 	const std::vector<NativeDependencyMatchKey>& dependencies,
 	const std::vector<NativeDependencyMatchKey>& records)
@@ -56,7 +58,8 @@ inline std::vector<size_t> MatchNativeDependencyRecordsMutuallyUnique(
 	const size_t missing = (std::numeric_limits<size_t>::max)();
 	std::vector<size_t> result(dependencies.size(), missing);
 	std::vector<bool> usedRecords(records.size(), false);
-	const auto bindPhase = [&](const bool exactPath) {
+	enum class MatchPhase { ResolvedPath, StoredPath, NameOnly };
+	const auto bindPhase = [&](const MatchPhase phase) {
 		std::vector<std::vector<size_t>> candidates(dependencies.size());
 		std::vector<size_t> reverseCounts(records.size(), 0);
 		for (size_t dependencyIndex = 0; dependencyIndex < dependencies.size(); ++dependencyIndex) {
@@ -72,12 +75,19 @@ inline std::vector<size_t> MatchNativeDependencyRecordsMutuallyUnique(
 				const bool namesConflict = !dependency.name.empty() && !record.name.empty() &&
 					dependency.name != record.name;
 				bool matches = false;
-				if (exactPath) {
+				if (phase == MatchPhase::ResolvedPath) {
 					matches = !dependency.path.empty() && !record.path.empty() &&
 						dependency.path == record.path && !namesConflict;
 				}
+				else if (phase == MatchPhase::StoredPath) {
+					matches = !dependency.storedPath.empty() && !record.storedPath.empty() &&
+						dependency.storedPath == record.storedPath && !namesConflict;
+				}
 				else {
-					matches = (dependency.path.empty() || record.path.empty()) &&
+					const bool dependencyHasPath =
+						!dependency.path.empty() || !dependency.storedPath.empty();
+					const bool recordHasPath = !record.path.empty() || !record.storedPath.empty();
+					matches = (!dependencyHasPath || !recordHasPath) &&
 						!dependency.name.empty() && dependency.name == record.name;
 				}
 				if (matches) {
@@ -99,8 +109,9 @@ inline std::vector<size_t> MatchNativeDependencyRecordsMutuallyUnique(
 			}
 		}
 	};
-	bindPhase(true);
-	bindPhase(false);
+	bindPhase(MatchPhase::ResolvedPath);
+	bindPhase(MatchPhase::StoredPath);
+	bindPhase(MatchPhase::NameOnly);
 	return result;
 }
 

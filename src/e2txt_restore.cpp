@@ -1653,6 +1653,7 @@ std::vector<size_t> MatchNativeDependencyRecordIndices(
 			CanonicalizeDependencyMatchPath(
 				dependency.resolvedPath.empty() ? dependency.path : dependency.resolvedPath,
 				sourcePath),
+			NormalizeDependencyMatchText(dependency.path),
 		});
 	}
 	std::vector<NativeDependencyMatchKey> recordKeys;
@@ -1661,6 +1662,7 @@ std::vector<size_t> MatchNativeDependencyRecordIndices(
 		recordKeys.push_back(NativeDependencyMatchKey{
 			NormalizeDependencyMatchText(record.name),
 			CanonicalizeDependencyMatchPath(record.path, sourcePath),
+			NormalizeDependencyMatchText(record.path),
 		});
 	}
 	const auto compactMatches = MatchNativeDependencyRecordsMutuallyUnique(dependencyKeys, recordKeys);
@@ -1737,9 +1739,15 @@ bool ApplyNativeDependencyDefinedIds(
 				dependency.resolvedPath.empty() ? dependency.path : dependency.resolvedPath,
 				bundle.sourcePath);
 			dependency.trustedNativeName = NormalizeDependencyMatchText(nativeRecords[matchedIndex].name);
-			dependency.trustedNativePath = CanonicalizeDependencyMatchPath(
-				nativeRecords[matchedIndex].path,
-				bundle.sourcePath);
+			const bool storedPathsMatch =
+				!NormalizeDependencyMatchText(dependency.path).empty() &&
+				NormalizeDependencyMatchText(dependency.path) ==
+					NormalizeDependencyMatchText(nativeRecords[matchedIndex].path);
+			dependency.trustedNativePath = storedPathsMatch
+				? dependency.trustedEditablePath
+				: CanonicalizeDependencyMatchPath(
+					nativeRecords[matchedIndex].path,
+					bundle.sourcePath);
 			dependency.nativeClasses = nativeRecords[matchedIndex].classes;
 			dependency.nativeGlobals = nativeRecords[matchedIndex].globals;
 			dependency.nativeStructs = nativeRecords[matchedIndex].structs;
