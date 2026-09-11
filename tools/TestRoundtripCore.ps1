@@ -1316,6 +1316,12 @@ $crossControlClassText = @'
 
 返回 (10 ＋ 3 － 2)
 
+.子程序 ProbeQuotedConcatenation, 文本型
+.参数 itemIndex, 整数型
+
+返回 (“第：” ＋ 到文本 (itemIndex) ＋ “条代理API异常请检查”)
+
+
 .子程序 ProbeMultiplicativeAssociativity, 双精度小数型
 
 返回 (24 × 3 ÷ 2)
@@ -1357,6 +1363,7 @@ Invoke-Packager @('compare-bundle', $crossControlCandidate2, $crossControlUnpack
 
 $crossControlExpectedLine = '返回 (_启动窗口.超级列表框1.取标题 (_启动窗口.超级列表框1.现行选中项, 1))'
 $additiveAssociativityLine = '返回 (10 ＋ 3 － 2)'
+$quotedConcatenationLine = '返回 (“第：” ＋ 到文本 (itemIndex) ＋ “条代理API异常请检查”)'
 $multiplicativeAssociativityLine = '返回 (24 × 3 ÷ 2)'
 $crossControlSource1 = Join-Path $crossControlUnpacked1 "src\$crossControlClassName.txt"
 $crossControlSource2 = Join-Path $crossControlUnpacked2 "src\$crossControlClassName.txt"
@@ -1364,6 +1371,8 @@ foreach ($crossControlSource in @($crossControlSource1, $crossControlSource2)) {
     $projection = [IO.File]::ReadAllText($crossControlSource)
     if (-not $projection.Contains($crossControlExpectedLine) -or
         -not $projection.Contains($additiveAssociativityLine) -or
+        -not $projection.Contains($quotedConcatenationLine) -or
+        -not $projection.Contains($quotedConcatenationLine + "`r`n`r`n`r`n.子程序 ProbeMultiplicativeAssociativity") -or
         -not $projection.Contains($multiplicativeAssociativityLine) -or
         $projection.Contains('_Control_0x') -or
         $projection.Contains('_Lib')) {

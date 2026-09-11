@@ -3751,10 +3751,11 @@ EffectiveMethodBodyLines BuildEffectiveMethodBodyLinesForEncoding(const std::vec
 		result.leadingTrimmed = 1;
 	}
 
-	size_t trailingTrimmed = 0;
-	while (end > begin && trailingTrimmed < 2 && IsBlankLine(result.lines[end - 1])) {
+	// BuildProgramPages appends exactly one separator line after every method.
+	// Any additional trailing blank lines belong to the native method body and
+	// must survive a semantic rebuild as explicit blank statements.
+	if (end > begin && IsBlankLine(result.lines[end - 1])) {
 		--end;
-		++trailingTrimmed;
 	}
 
 	if (begin != 0 || end != result.lines.size()) {
@@ -5650,7 +5651,8 @@ bool TryEncodeNativeExpression(
 	std::vector<std::int32_t>& constantReferences,
 	std::string* outError = nullptr)
 {
-	const std::string expression = NormalizeNativeOperatorSyntaxForParsing(StripOuterParentheses(rawExpression));
+	const std::string sourceExpression = StripOuterParentheses(rawExpression);
+	const std::string expression = NormalizeNativeOperatorSyntaxForParsing(sourceExpression);
 	if (expression.empty()) {
 		writer.WriteU8(0x16);
 		return true;
@@ -5745,7 +5747,12 @@ bool TryEncodeNativeExpression(
 
 	std::string textValue;
 	bool isLongText = false;
-	if (TryDecodeExpressionTextLiteral(expression, textValue, isLongText) && !isLongText) {
+	// A canonical native operator outside a quoted segment changes during normalization.
+	// In that case the surrounding quotes belong to separate operands, not one dump literal.
+	// Keeping unchanged legacy ASCII payloads on the literal path preserves their native bytes.
+	if (sourceExpression == expression &&
+		TryDecodeExpressionTextLiteral(expression, textValue, isLongText) &&
+		!isLongText) {
 		writer.WriteU8(0x1A);
 		writer.WriteBStr(std::make_optional(textValue));
 		return true;
