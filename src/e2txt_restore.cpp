@@ -158,6 +158,7 @@ struct RestoreClass {
 	std::vector<std::int32_t> functionIds;
 	std::vector<RestoreVariable> vars;
 	bool isFormClass = false;
+	bool isUserClass = false;
 	bool isPublic = false;
 	bool isHidden = false;
 };
@@ -11841,6 +11842,7 @@ bool BuildRestoreModel(
 					item.id = preferredIsClass
 						? preferredId
 						: dependencyIds.AllocTopLevel(allocator, epl_system_id::kTypeStaticClass);
+					item.isUserClass = epl_system_id::GetType(item.id) == epl_system_id::kTypeClass;
 					allocator.Observe(item.id);
 					item.memoryAddress = memoryAddress;
 					item.baseClass = baseClass;
@@ -12775,6 +12777,7 @@ bool BuildRestoreModel(
 					epl_system_id::kTypeStaticClass,
 					hiddenNativeClassId);
 			}
+			hiddenTemp.isUserClass = epl_system_id::GetType(hiddenTemp.id) == epl_system_id::kTypeClass;
 			hiddenTemp.memoryAddress = hiddenNative != nullptr ? hiddenNative->memoryAddress : 0;
 			hiddenTemp.name = "__HIDDEN_TEMP_MOD__";
 			hiddenTemp.comment = "dependency hidden module";
@@ -12821,6 +12824,7 @@ bool BuildRestoreModel(
 			else {
 				item.id = dependencyIds.AllocTopLevel(allocator, classType, nativeClassId);
 			}
+			item.isUserClass = epl_system_id::GetType(item.id) == epl_system_id::kTypeClass;
 			item.memoryAddress = nativeClass != nullptr ? nativeClass->memoryAddress : 0;
 			item.name = parsedClass.name;
 			item.comment = parsedClass.comment;
@@ -12867,6 +12871,7 @@ bool BuildRestoreModel(
 					}
 					return false;
 				}
+				item.isUserClass = epl_system_id::GetType(item.id) == epl_system_id::kTypeClass;
 				item.memoryAddress = nativeClass.memoryAddress;
 				item.name = nativeClass.name;
 				item.baseClass = nativeClass.baseClass;
@@ -13772,6 +13777,7 @@ bool BuildRestoreModel(
 		item.comment = parsedClass.comment;
 		item.isPublic = parsedClass.isPublic;
 		item.isFormClass = parsedClass.isFormClass;
+		item.isUserClass = parsedClass.isUserClass;
 		localClassModelIndices.push_back(model.classes.size());
 		model.classes.push_back(std::move(item));
 		resolver.RegisterUserType(parsedClass.name, model.classes.back().id);
@@ -14249,6 +14255,15 @@ bool BuildRestoreModel(
 			outError)) {
 		return false;
 	}
+	// Bare calls may target ordinary and window assemblies. Object-class methods
+	// require an object target outside their own class, while localFunctionsByName
+	// below keeps the language's implicit self-call form available inside the class.
+	std::unordered_set<std::int32_t> globallyCallableOwnerIds;
+	for (const auto& sourceClass : model.classes) {
+		if (!sourceClass.isUserClass && sourceClass.id != 0) {
+			globallyCallableOwnerIds.insert(sourceClass.id);
+		}
+	}
 
 	for (size_t classIndex = 0; classIndex < parsedClasses.size(); ++classIndex) {
 		const auto& parsedClass = parsedClasses[classIndex];
@@ -14547,7 +14562,11 @@ bool BuildRestoreModel(
 							sourceMethodKey,
 							sourceMethodSymbol);
 					}
-					nativeObjectEncodeContext.functionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
+					if (!parsedClasses[sourceClassIndex].isUserClass) {
+						nativeObjectEncodeContext.functionsByName.insert_or_assign(
+							sourceMethodKey,
+							sourceMethodSymbol);
+					}
 					nativeObjectEncodeContext
 						.methodsByOwnerType[sourceSnapshot->classId]
 						.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
@@ -14557,11 +14576,13 @@ bool BuildRestoreModel(
 				if (existingMethod.id == 0 || existingMethod.name.empty()) {
 					continue;
 				}
-				nativeObjectEncodeContext
-					.functionsByName
-					.insert_or_assign(
-						TypeResolver::NormalizeTypeName(existingMethod.name),
-						NativeFunctionSymbol{ -2, existingMethod.id });
+				if (globallyCallableOwnerIds.contains(existingMethod.ownerClass)) {
+					nativeObjectEncodeContext
+						.functionsByName
+						.insert_or_assign(
+							TypeResolver::NormalizeTypeName(existingMethod.name),
+							NativeFunctionSymbol{ -2, existingMethod.id });
+				}
 				nativeObjectEncodeContext.functionNamesById.insert_or_assign(
 					existingMethod.id,
 					TypeResolver::NormalizeTypeName(existingMethod.name));
@@ -14612,7 +14633,11 @@ bool BuildRestoreModel(
 							sourceMethodKey,
 							sourceMethodSymbol);
 					}
-					nativeObjectEncodeContext.functionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
+					if (!sourceClass.isUserClass) {
+						nativeObjectEncodeContext.functionsByName.insert_or_assign(
+							sourceMethodKey,
+							sourceMethodSymbol);
+					}
 					nativeObjectEncodeContext
 						.methodsByOwnerType[sourceOwnerTypeId]
 						.insert_or_assign(sourceMethodKey, sourceMethodSymbol);

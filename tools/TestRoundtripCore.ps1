@@ -544,6 +544,106 @@ $repairedOrdinarySnapshot = Get-SnapshotByMethod $untrustedKindProjection 'Ordin
 if (($repairedOrdinarySnapshot.classId -band 0xFF000000) -ne 0x09000000 -or $repairedOrdinarySnapshot.baseClass -ne 0) {
     throw 'untrusted supplemental class metadata overrode a newly added ordinary assembly header'
 }
+
+# Object-class methods are callable without a target only from their own class.
+# External callers must bind through an object variable so source enumeration
+# order cannot turn a bare assembly call into an object-method call.
+$objectMethodWorkspace = Join-Path $OutputRoot 'object-method-binding-workspace'
+Invoke-Packager @('unpack', $consoleTemplate, $objectMethodWorkspace, '--main-only')
+$objectMethodHostPath = Get-ChildItem -LiteralPath (Join-Path $objectMethodWorkspace 'src') -Filter '*.txt' -File |
+    Where-Object { -not $_.Name.StartsWith('.') } |
+    Select-Object -First 1
+if ($null -eq $objectMethodHostPath) {
+    throw 'object-method binding host source page is missing'
+}
+Write-EText $objectMethodHostPath.FullName @'
+.版本 2
+
+.程序集 ObjectMethodHost
+
+.子程序 _启动子程序, 整数型
+
+返回 (0)
+
+.子程序 ProbeQualifiedObjectCall, 整数型
+.局部变量 obj, ObjectMethodProbe
+.局部变量 result, 整数型
+
+result ＝ obj.ProbeObjectMethod ()
+返回 (result)
+'@
+$objectMethodClassPath = Join-Path $objectMethodWorkspace 'src\ObjectMethodProbe.txt'
+Write-EText $objectMethodClassPath @'
+.版本 2
+
+.程序集 ObjectMethodProbe, <对象>, 公开
+
+.子程序 ProbeObjectMethod, 整数型, 公开
+
+返回 (77)
+
+.子程序 ProbeSelfCall, 整数型, 公开
+.局部变量 result, 整数型
+
+result ＝ ProbeObjectMethod ()
+返回 (result)
+'@
+$objectMethodCandidate = Join-Path $OutputRoot 'object-method-binding.e'
+$objectMethodUnpacked = Join-Path $OutputRoot 'object-method-binding-unpacked'
+Invoke-Packager @('pack', $objectMethodWorkspace, $objectMethodCandidate)
+Invoke-Packager @('unpack', $objectMethodCandidate, $objectMethodUnpacked, '--main-only')
+$objectMethodNativeMap = @(Get-Content -LiteralPath (Join-Path $objectMethodUnpacked 'project\.native_source_map.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
+$objectMethodClassSnapshot = @($objectMethodNativeMap | Where-Object { 'ProbeObjectMethod' -in $_.methods.name })[0]
+$objectMethodHostSnapshot = @($objectMethodNativeMap | Where-Object { 'ProbeQualifiedObjectCall' -in $_.methods.name })[0]
+if ($null -eq $objectMethodClassSnapshot -or $null -eq $objectMethodHostSnapshot -or
+    ($objectMethodClassSnapshot.classId -band 0xFF000000) -ne 0x49000000 -or
+    ($objectMethodHostSnapshot.classId -band 0xFF000000) -ne 0x09000000) {
+    throw 'object-method binding owner kinds are missing or incorrect'
+}
+$objectMethod = @($objectMethodClassSnapshot.methods | Where-Object { $_.name -eq 'ProbeObjectMethod' })[0]
+$objectSelfCallMethod = @($objectMethodClassSnapshot.methods | Where-Object { $_.name -eq 'ProbeSelfCall' })[0]
+$objectQualifiedCallMethod = @($objectMethodHostSnapshot.methods | Where-Object { $_.name -eq 'ProbeQualifiedObjectCall' })[0]
+if ($null -eq $objectMethod -or $null -eq $objectSelfCallMethod -or $null -eq $objectQualifiedCallMethod) {
+    throw 'object-method binding regression methods are missing'
+}
+$objectSelfCallHeader = [byte[]](@(0x21) +
+    [BitConverter]::GetBytes([int]$objectMethod.id) +
+    [BitConverter]::GetBytes([int16]-2))
+$objectQualifiedCallHeader = [byte[]](@(0x21) +
+    [BitConverter]::GetBytes([int]$objectMethod.id) +
+    [BitConverter]::GetBytes([int16]-2))
+$objectSelfCallExpression = [Convert]::FromBase64String($objectSelfCallMethod.expressionData)
+$objectQualifiedCallExpression = [Convert]::FromBase64String($objectQualifiedCallMethod.expressionData)
+if ((Get-NativeByteSequenceCount $objectSelfCallExpression $objectSelfCallHeader) -ne 1) {
+    throw 'object-class self-call did not bind through the current-class local catalog'
+}
+if ((Get-NativeByteSequenceCount $objectQualifiedCallExpression $objectQualifiedCallHeader) -ne 1) {
+    throw 'qualified object call did not bind through its target owner'
+}
+$objectMethodHostProjection = [IO.File]::ReadAllText((Join-Path $objectMethodUnpacked 'src\ObjectMethodHost.txt'))
+if (-not $objectMethodHostProjection.Contains('result ＝ obj.ProbeObjectMethod ()')) {
+    throw 'qualified object call did not survive the source projection'
+}
+
+$unqualifiedObjectWorkspace = Join-Path $OutputRoot 'unqualified-object-method-workspace'
+Copy-Item -LiteralPath $objectMethodUnpacked -Destination $unqualifiedObjectWorkspace -Recurse
+$unqualifiedHostPath = Get-ChildItem -LiteralPath (Join-Path $unqualifiedObjectWorkspace 'src') -Filter '*.txt' -File |
+    Where-Object { [IO.File]::ReadAllText($_.FullName).Contains('ProbeQualifiedObjectCall') } |
+    Select-Object -First 1
+if ($null -eq $unqualifiedHostPath) {
+    throw 'unqualified object-method negative host source page is missing'
+}
+$unqualifiedHostText = [IO.File]::ReadAllText($unqualifiedHostPath.FullName).Replace(
+    'result ＝ obj.ProbeObjectMethod ()',
+    'result ＝ ProbeObjectMethod ()')
+Write-EText $unqualifiedHostPath.FullName $unqualifiedHostText
+$unqualifiedObjectCandidate = Join-Path $OutputRoot 'unqualified-object-method.e'
+$unqualifiedObjectOutput = & $Packager pack $unqualifiedObjectWorkspace $unqualifiedObjectCandidate 2>&1 | Out-String
+$unqualifiedObjectExitCode = $LASTEXITCODE
+if ($unqualifiedObjectExitCode -eq 0 -or
+    -not $unqualifiedObjectOutput.Contains('function_not_found: ProbeObjectMethod')) {
+    throw "bare call to an external object-class method did not fail closed: exit=$unqualifiedObjectExitCode output=$unqualifiedObjectOutput"
+}
 $kindNativeMapPath = Join-Path $kindProjection 'project\.native_source_map.json'
 $kindNativeMap = @(Get-Content -LiteralPath $kindNativeMapPath -Raw -Encoding UTF8 | ConvertFrom-Json)
 $kindNativeProbe = @($kindNativeMap | Where-Object { 'ProbeValue' -in $_.methods.name })[0]
@@ -1898,6 +1998,9 @@ $result = [ordered]@{
 	header_kind_ordinary_second_projection_sha256 = $secondOrdinaryProjectionHash.ToLowerInvariant()
 	header_kind_roundtrip_stable = $true
 	header_kind_untrusted_snapshot_repaired = $true
+	object_method_self_call_id = ('0x{0:X8}' -f [int]$objectMethod.id)
+	object_method_qualified_call_bound = $true
+	object_method_unqualified_external_call_rejected = $true
 	same_name_function_ids = $sharedBindingIds[0]
 	stale_same_name_snapshot_repaired = $true
 	semantic_true_encoding = '0xFFFF'
