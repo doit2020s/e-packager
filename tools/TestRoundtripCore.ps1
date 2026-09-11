@@ -299,12 +299,19 @@ $programText = @'
 .如果真 (结果 <> 0 且 结果 ％ 2 = 0)
     返回 (结果)  ' 分支返回注释
 .如果真结束
+.如果真 (#RT_INTERVAL ＞ 0 且 结果 ＜ 取重试次数 ())  ' 常量开头的复合条件
+    结果 ＝ 结果 ＋ 1
+.如果真结束
 返回 (0)  ' 尾部返回必须保留
 
 .子程序 接收数据, 整数型, 公开
 .参数 数据, 字节集
 .参数 数值, 整数型
 返回 (数值)
+
+.子程序 取重试次数, 整数型
+
+返回 (3)
 '@
 
 $constantText = @'
@@ -312,6 +319,7 @@ $constantText = @'
 
 .常量 RT_TRUE, 真, 公开, 布尔真常量
 .常量 RT_FALSE, 假, , 布尔假常量
+.常量 RT_INTERVAL, 3, , 复合条件常量
 '@
 
 $structText = @'
@@ -393,6 +401,7 @@ $requiredLines = @(
     '结果 = RT_GetTickCount (0)  '' 本地 DLL 命令必须在方法语义重建前注册',
     '.如果真 (结果 != 0 且 结果 % 2 = 0)',
     '返回 (结果)  '' 分支返回注释',
+    '.如果真 (#RT_INTERVAL > 0 且 结果 < 取重试次数 ())  '' 常量开头的复合条件',
     '返回 (0)  '' 尾部返回必须保留'
 ) | ForEach-Object { Normalize-Line $_ }
 foreach ($requiredLine in $requiredLines) {
@@ -406,7 +415,7 @@ $fixedText = @(
     [IO.File]::ReadAllText((Join-Path $unpacked2 'src\.数据类型.txt')),
     [IO.File]::ReadAllText((Join-Path $unpacked2 'src\.DLL声明.txt'))
 ) -join "`n"
-foreach ($requiredText in @('RT_TRUE', 'RT_FALSE', '第二行结构备注', '第二行成员备注', '第二行DLL备注', '第二行参数备注')) {
+foreach ($requiredText in @('RT_TRUE', 'RT_FALSE', 'RT_INTERVAL', '第二行结构备注', '第二行成员备注', '第二行DLL备注', '第二行参数备注')) {
     if (-not $fixedText.Contains($requiredText)) {
         throw "roundtrip fixed-table text missing: $requiredText"
     }
@@ -571,6 +580,14 @@ Write-EText $objectMethodHostPath.FullName @'
 
 result ＝ obj.ProbeObjectMethod ()
 返回 (result)
+
+.子程序 ProbeStructuredTrailingComment, 整数型
+.参数 n, 整数型
+
+.如果真 (n ＜ 5)  ' structured trailing comment
+    返回 (1)
+.如果真结束
+返回 (0)
 '@
 $objectMethodClassPath = Join-Path $objectMethodWorkspace 'src\ObjectMethodProbe.txt'
 Write-EText $objectMethodClassPath @'
@@ -623,6 +640,9 @@ if ((Get-NativeByteSequenceCount $objectQualifiedCallExpression $objectQualified
 $objectMethodHostProjection = [IO.File]::ReadAllText((Join-Path $objectMethodUnpacked 'src\ObjectMethodHost.txt'))
 if (-not $objectMethodHostProjection.Contains('result ＝ obj.ProbeObjectMethod ()')) {
     throw 'qualified object call did not survive the source projection'
+}
+if (-not $objectMethodHostProjection.Contains(".如果真 (n ＜ 5)  ' structured trailing comment")) {
+    throw 'structured control trailing comment did not survive the source projection'
 }
 
 # A plain assembly is a static namespace and cannot be instantiated in a local
@@ -2172,6 +2192,8 @@ $result = [ordered]@{
 	removed_method_reference_rejected = $true
 	object_method_self_call_id = ('0x{0:X8}' -f [int]$objectMethod.id)
 	object_method_qualified_call_bound = $true
+	structured_control_trailing_comment_preserved = $true
+	constant_led_logical_condition_encoded = $true
 	static_assembly_object_target_rejected = $true
 	object_method_unqualified_external_call_rejected = $true
 	object_method_scope_change_target_id = ('0x{0:X8}' -f $assemblyObjectId)

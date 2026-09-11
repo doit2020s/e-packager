@@ -2761,13 +2761,33 @@ private:
 	std::vector<const RestoreDependencyInfo*> m_supportLibraryOrder;
 };
 
+bool TryGetNativeTextQuoteLength(const std::string& text, size_t offset, size_t& outLength);
+std::string TrimRightAsciiCopy(std::string text);
+
 std::optional<std::pair<std::string, std::string>> SplitFixedCodeComment(const std::string& text)
 {
-	const size_t pos = text.find("  ' ");
-	if (pos == std::string::npos) {
-		return std::make_pair(text, std::string());
+	bool inChineseQuote = false;
+	bool inAsciiQuote = false;
+	for (size_t index = 0; index < text.size(); ++index) {
+		size_t quoteLength = 0;
+		if (!inAsciiQuote && TryGetNativeTextQuoteLength(text, index, quoteLength)) {
+			inChineseQuote = !inChineseQuote;
+			index += quoteLength - 1;
+			continue;
+		}
+		if (!inChineseQuote && text[index] == '"') {
+			inAsciiQuote = !inAsciiQuote;
+			continue;
+		}
+		if (!inChineseQuote && !inAsciiQuote && text[index] == '\'') {
+			std::string comment = text.substr(index + 1);
+			if (!comment.empty() && comment.front() == ' ') {
+				comment.erase(0, 1);
+			}
+			return std::make_pair(TrimRightAsciiCopy(text.substr(0, index)), std::move(comment));
+		}
 	}
-	return std::make_pair(text.substr(0, pos), text.substr(pos + 4));
+	return std::make_pair(text, std::string());
 }
 
 struct BodyStatement;
@@ -2775,6 +2795,7 @@ struct BodyStatement;
 struct BodySwitchCase {
 	bool mask = false;
 	std::string code;
+	std::string fixedComment;
 	std::vector<BodyStatement> block;
 };
 
@@ -3346,7 +3367,12 @@ bool ParseSwitchBlock(
 {
 	BodyStatement statement;
 	statement.kind = BodyStatementKind::SwitchBlock;
-	statement.cases.push_back(BodySwitchCase{ firstMask, firstCaseCode, {} });
+	const auto firstCaseSplit = SplitFixedCodeComment(firstCaseCode);
+	statement.cases.push_back(BodySwitchCase{
+		firstMask,
+		firstCaseSplit->first,
+		firstCaseSplit->second,
+		{} });
 
 	if (!ParseBodyBlock(
 			lines,
@@ -3395,7 +3421,9 @@ bool ParseSwitchBlock(
 
 		BodySwitchCase nextCase;
 		nextCase.mask = mask;
-		nextCase.code = code.substr(1);
+		const auto split = SplitFixedCodeComment(code.substr(1));
+		nextCase.code = split->first;
+		nextCase.fixedComment = split->second;
 		++index;
 		if (!ParseBodyBlock(
 				lines,
@@ -3503,7 +3531,9 @@ bool ParseBodyBlock(
 			BodyStatement statement;
 			statement.kind = BodyStatementKind::IfTrue;
 			statement.mask = mask;
-			statement.code = code.substr(1);
+			const auto headerSplit = SplitFixedCodeComment(code.substr(1));
+			statement.code = headerSplit->first;
+			statement.fixedComment = headerSplit->second;
 			++index;
 			if (!ParseBodyBlock(lines, index, expectedIndent + 1, { ".如果真结束" }, statement.block, outError, outErrorLineIndex)) {
 				return false;
@@ -3538,7 +3568,9 @@ bool ParseBodyBlock(
 			BodyStatement statement;
 			statement.kind = BodyStatementKind::IfElse;
 			statement.mask = mask;
-			statement.code = code.substr(1);
+			const auto split = SplitFixedCodeComment(code.substr(1));
+			statement.code = split->first;
+			statement.fixedComment = split->second;
 			++index;
 			if (!ParseBodyBlock(lines, index, expectedIndent + 1, { ".否则" }, statement.block, outError, outErrorLineIndex)) {
 				return false;
@@ -3598,7 +3630,9 @@ bool ParseBodyBlock(
 			BodyStatement statement;
 			statement.kind = BodyStatementKind::WhileLoop;
 			statement.mask = mask;
-			statement.code = code.substr(1);
+			const auto split = SplitFixedCodeComment(code.substr(1));
+			statement.code = split->first;
+			statement.fixedComment = split->second;
 			++index;
 			if (!ParseBodyBlock(lines, index, expectedIndent + 1, { ".判断循环尾 ()" }, statement.block, outError, outErrorLineIndex)) {
 				return false;
@@ -3615,8 +3649,8 @@ bool ParseBodyBlock(
 			bool endMask = false;
 			std::string endCode;
 			ExtractMaskPrefix(lines[index], endMask, endCode);
-			const auto split = SplitFixedCodeComment(TrimAsciiCopy(endCode));
-			if (!split.has_value() || split->first != ".判断循环尾 ()") {
+			const auto endSplit = SplitFixedCodeComment(TrimAsciiCopy(endCode));
+			if (!endSplit.has_value() || endSplit->first != ".判断循环尾 ()") {
 				if (outError != nullptr) {
 					*outError = "while_end_invalid";
 				}
@@ -3626,7 +3660,7 @@ bool ParseBodyBlock(
 				return false;
 			}
 			statement.maskOnEnd = endMask;
-			statement.fixedEndComment = split->second;
+			statement.fixedEndComment = endSplit->second;
 			++index;
 			outStatements.push_back(std::move(statement));
 			continue;
@@ -3666,9 +3700,7 @@ bool ParseBodyBlock(
 				return false;
 			}
 			statement.endCode = endSplit->first.substr(1);
-			if (statement.fixedComment.empty()) {
-				statement.fixedComment = endSplit->second;
-			}
+			statement.fixedEndComment = endSplit->second;
 			++index;
 			outStatements.push_back(std::move(statement));
 			continue;
@@ -3678,7 +3710,9 @@ bool ParseBodyBlock(
 			BodyStatement statement;
 			statement.kind = BodyStatementKind::CounterLoop;
 			statement.mask = mask;
-			statement.code = code.substr(1);
+			const auto headerSplit = SplitFixedCodeComment(code.substr(1));
+			statement.code = headerSplit->first;
+			statement.fixedComment = headerSplit->second;
 			++index;
 			if (!ParseBodyBlock(lines, index, expectedIndent + 1, { ".计次循环尾 ()" }, statement.block, outError, outErrorLineIndex)) {
 				return false;
@@ -3695,8 +3729,8 @@ bool ParseBodyBlock(
 			bool endMask = false;
 			std::string endCode;
 			ExtractMaskPrefix(lines[index], endMask, endCode);
-			const auto split = SplitFixedCodeComment(TrimAsciiCopy(endCode));
-			if (!split.has_value() || split->first != ".计次循环尾 ()") {
+			const auto endSplit = SplitFixedCodeComment(TrimAsciiCopy(endCode));
+			if (!endSplit.has_value() || endSplit->first != ".计次循环尾 ()") {
 				if (outError != nullptr) {
 					*outError = "counter_end_invalid";
 				}
@@ -3706,7 +3740,7 @@ bool ParseBodyBlock(
 				return false;
 			}
 			statement.maskOnEnd = endMask;
-			statement.fixedEndComment = split->second;
+			statement.fixedEndComment = endSplit->second;
 			++index;
 			outStatements.push_back(std::move(statement));
 			continue;
@@ -3716,7 +3750,9 @@ bool ParseBodyBlock(
 			BodyStatement statement;
 			statement.kind = BodyStatementKind::ForLoop;
 			statement.mask = mask;
-			statement.code = code.substr(1);
+			const auto headerSplit = SplitFixedCodeComment(code.substr(1));
+			statement.code = headerSplit->first;
+			statement.fixedComment = headerSplit->second;
 			++index;
 			if (!ParseBodyBlock(lines, index, expectedIndent + 1, { ".变量循环尾 ()" }, statement.block, outError, outErrorLineIndex)) {
 				return false;
@@ -3733,8 +3769,8 @@ bool ParseBodyBlock(
 			bool endMask = false;
 			std::string endCode;
 			ExtractMaskPrefix(lines[index], endMask, endCode);
-			const auto split = SplitFixedCodeComment(TrimAsciiCopy(endCode));
-			if (!split.has_value() || split->first != ".变量循环尾 ()") {
+			const auto endSplit = SplitFixedCodeComment(TrimAsciiCopy(endCode));
+			if (!endSplit.has_value() || endSplit->first != ".变量循环尾 ()") {
 				if (outError != nullptr) {
 					*outError = "for_end_invalid";
 				}
@@ -3744,7 +3780,7 @@ bool ParseBodyBlock(
 				return false;
 			}
 			statement.maskOnEnd = endMask;
-			statement.fixedEndComment = split->second;
+			statement.fixedEndComment = endSplit->second;
 			++index;
 			outStatements.push_back(std::move(statement));
 			continue;
@@ -4507,8 +4543,6 @@ struct NativeObjectMethodEncodeContext {
 	std::int32_t implicitSupportTypeId = 0;
 	const TypeResolver* typeResolver = nullptr;
 };
-
-bool TryGetNativeTextQuoteLength(const std::string& text, size_t offset, size_t& outLength);
 
 bool TryFindNonInstantiableObjectTarget(
 	const std::string& rawCode,
@@ -5918,7 +5952,10 @@ bool TryEncodeNativeExpression(
 		return true;
 	}
 
-	if (expression.front() == '#') {
+	const bool isAtomicConstantExpression =
+		expression.front() == '#' &&
+		expression.find_first_of(" \t\r\n()[]{}.,+-*/\\%<>=!&|?") == std::string::npos;
+	if (isAtomicConstantExpression) {
 		const std::string constantName = TrimAsciiCopy(expression.substr(1));
 		const auto constantIt = context.constantsByName.find(TypeResolver::NormalizeTypeName(constantName));
 		if (constantIt != context.constantsByName.end() && constantIt->second.id != 0) {
@@ -6435,6 +6472,7 @@ bool TryEncodeNativeStructuredCall(
 	const bool mask,
 	const std::string& code,
 	const std::string& expectedName,
+	const std::string& fixedComment,
 	const NativeObjectMethodEncodeContext& context,
 	EncodedNativeExpression& outExpression,
 	std::string* outError = nullptr)
@@ -6456,7 +6494,12 @@ bool TryEncodeNativeStructuredCall(
 
 	ByteWriter writer;
 	writer.WriteU8(type);
-	WriteNativeCallHeader(writer, methodId, 0, static_cast<std::int16_t>(mask ? 0x20 : 0));
+	WriteNativeCallHeader(
+		writer,
+		methodId,
+		0,
+		static_cast<std::int16_t>(mask ? 0x20 : 0),
+		fixedComment);
 	writer.WriteU8(0x36);
 	for (const auto& arg : call.args) {
 		std::string expressionError;
@@ -6552,6 +6595,7 @@ bool WriteBlockWithStructuredControlEncoding(
 					statement.mask,
 					statement.code,
 					"如果真",
+					statement.fixedComment,
 					context,
 					header,
 					&encodeError);
@@ -6593,6 +6637,7 @@ bool WriteBlockWithStructuredControlEncoding(
 					statement.mask,
 					statement.code,
 					"如果",
+					statement.fixedComment,
 					context,
 					header,
 					&encodeError);
@@ -6635,6 +6680,7 @@ bool WriteBlockWithStructuredControlEncoding(
 					statement.mask,
 					statement.code,
 					"判断循环首",
+					statement.fixedComment,
 					context,
 					header,
 					&encodeError);
@@ -6673,6 +6719,7 @@ bool WriteBlockWithStructuredControlEncoding(
 					statement.maskOnEnd,
 					statement.endCode,
 					"循环判断尾",
+					statement.fixedEndComment,
 					context,
 					tail,
 					&encodeError);
@@ -6711,6 +6758,7 @@ bool WriteBlockWithStructuredControlEncoding(
 					statement.mask,
 					statement.code,
 					"计次循环首",
+					statement.fixedComment,
 					context,
 					header,
 					&encodeError);
@@ -6749,6 +6797,7 @@ bool WriteBlockWithStructuredControlEncoding(
 					statement.mask,
 					statement.code,
 					"变量循环首",
+					statement.fixedComment,
 					context,
 					header,
 					&encodeError);
@@ -6790,6 +6839,7 @@ bool WriteBlockWithStructuredControlEncoding(
 						caseItem.mask,
 						caseItem.code,
 						"判断",
+						caseItem.fixedComment,
 						context,
 						header,
 						&encodeError);
@@ -7453,6 +7503,7 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 					statement.mask,
 					statement.code,
 					expectedName,
+					statement.fixedComment,
 					encodeContext,
 					header,
 					&encodeError);
@@ -7498,6 +7549,7 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 				statement.maskOnEnd,
 				statement.endCode,
 				"循环判断尾",
+				statement.fixedEndComment,
 				encodeContext,
 				tail,
 				&encodeError);
@@ -7543,6 +7595,7 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 				caseItem.mask,
 				caseItem.code,
 				"判断",
+				caseItem.fixedComment,
 				encodeContext,
 				header,
 				&encodeError);
