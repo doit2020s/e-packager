@@ -1247,7 +1247,13 @@ Copy-TestWorkspace $controlWorkspace $crossControlWorkspace
 $crossControlModulePath = Join-Path $crossControlWorkspace 'project\.module.json'
 $crossControlModule = Get-Content -LiteralPath $crossControlModulePath -Raw -Encoding UTF8 | ConvertFrom-Json
 if (-not @($crossControlModule.dependencies | Where-Object { $_.kind -eq 'elib' -and $_.fileName -eq 'iext' })) {
-    $crossControlModule.dependencies = @($crossControlModule.dependencies) + @([pscustomobject]@{
+	$existingCrossControlDependencies = @($crossControlModule.dependencies)
+	if ($existingCrossControlDependencies.Count -eq 0 -or
+		$existingCrossControlDependencies[0].kind -ne 'elib' -or
+		$existingCrossControlDependencies[0].fileName -ne 'krnln') {
+		throw 'cross-form fixture core dependency must remain first'
+	}
+	$iextDependency = [pscustomobject]@{
         fileName = 'iext'
         guid = '27bb20fdd3e145e4bee3db39ddd6e64c'
         kind = 'elib'
@@ -1255,7 +1261,9 @@ if (-not @($crossControlModule.dependencies | Where-Object { $_.kind -eq 'elib' 
         path = ''
         reExport = $false
         versionText = '2.0'
-    })
+	}
+	$crossControlModule.dependencies = @($existingCrossControlDependencies[0], $iextDependency) +
+		@($existingCrossControlDependencies | Select-Object -Skip 1)
 }
 Write-EText $crossControlModulePath (($crossControlModule | ConvertTo-Json -Depth 20) + "`r`n")
 $crossControlLibraries = @($crossControlModule.dependencies | Where-Object { $_.kind -eq 'elib' })
@@ -1268,6 +1276,9 @@ for ($index = 0; $index -lt $crossControlLibraries.Count; $index++) {
 }
 if ($iextLibraryId -lt 0) { throw 'cross-form fixture iext dependency missing' }
 $iextControlTypeId = (($iextLibraryId + 1) -shl 16) -bor 4
+if ($iextControlTypeId -ne 0x00020004) {
+	throw ('cross-form fixture iext control type mismatch: 0x{0:X8}' -f $iextControlTypeId)
+}
 
 $crossControlStartXmlPath = Join-Path $crossControlWorkspace "src\$controlWindowName.xml"
 [xml]$crossControlStartXml = [IO.File]::ReadAllText($crossControlStartXmlPath)
@@ -1311,6 +1322,10 @@ $crossControlClassText = @'
 .子程序 ProbeCrossFormControl, 文本型
 
 返回 (_启动窗口.超级列表框1.取标题 (_启动窗口.超级列表框1.现行选中项, 1))
+
+.子程序 ProbeCrossFormOwner, 整数型
+
+返回 (_启动窗口.左边 ＋ CrossFormProbe.宽度)
 
 .子程序 ProbeAdditiveAssociativity, 整数型
 
@@ -1357,11 +1372,38 @@ $crossControlUnpacked2 = Join-Path $OutputRoot 'cross-form-control-unpacked-2'
 Invoke-Packager @('pack', $crossControlWorkspace, $crossControlCandidate1)
 Invoke-Packager @('unpack', $crossControlCandidate1, $crossControlUnpacked1, '--main-only')
 Invoke-Packager @('compare-bundle', $crossControlCandidate1, $crossControlUnpacked1)
-Invoke-Packager @('pack', $crossControlUnpacked1, $crossControlCandidate2)
+$crossControlStaleOwnerWorkspace = Join-Path $OutputRoot 'cross-form-control-stale-owner-workspace'
+Copy-TestWorkspace $crossControlUnpacked1 $crossControlStaleOwnerWorkspace
+$staleOwnerSymbolMap = Get-Content -LiteralPath (Join-Path $crossControlStaleOwnerWorkspace 'project\.native_symbol_map.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$staleOwnerFormIds = @(
+	[int](@($staleOwnerSymbolMap.forms | Where-Object { $_.name -eq $controlWindowName })[0].id),
+	[int](@($staleOwnerSymbolMap.forms | Where-Object { $_.name -eq $crossControlFormName })[0].id)
+)
+$staleOwnerNativeMapPath = Join-Path $crossControlStaleOwnerWorkspace 'project\.native_source_map.json'
+$staleOwnerNativeMap = @(Get-Content -LiteralPath $staleOwnerNativeMapPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+$staleOwnerMethod = @($staleOwnerNativeMap.methods | Where-Object { $_.name -eq 'ProbeCrossFormOwner' })[0]
+if ($null -eq $staleOwnerMethod) { throw 'cross-form stale-owner fixture method missing' }
+$staleOwnerExpression = [Convert]::FromBase64String($staleOwnerMethod.expressionData)
+$staleOwnerRewriteCount = 0
+for ($offset = 0; $offset + 8 -lt $staleOwnerExpression.Length; $offset++) {
+	if ($staleOwnerExpression[$offset] -ne 0x39) { continue }
+	$ownerTypeId = [BitConverter]::ToInt32($staleOwnerExpression, $offset + 5)
+	if ($staleOwnerFormIds -contains $ownerTypeId) {
+		[BitConverter]::GetBytes([int]0x00010001).CopyTo($staleOwnerExpression, $offset + 5)
+		$staleOwnerRewriteCount++
+	}
+}
+if ($staleOwnerRewriteCount -ne 2) {
+	throw "cross-form stale-owner fixture rewrite mismatch: $staleOwnerRewriteCount"
+}
+$staleOwnerMethod.expressionData = [Convert]::ToBase64String($staleOwnerExpression)
+Write-EText $staleOwnerNativeMapPath ((ConvertTo-Json -InputObject $staleOwnerNativeMap -Depth 100) + "`r`n")
+Invoke-Packager @('pack', $crossControlStaleOwnerWorkspace, $crossControlCandidate2)
 Invoke-Packager @('unpack', $crossControlCandidate2, $crossControlUnpacked2, '--main-only')
 Invoke-Packager @('compare-bundle', $crossControlCandidate2, $crossControlUnpacked2)
 
 $crossControlExpectedLine = '返回 (_启动窗口.超级列表框1.取标题 (_启动窗口.超级列表框1.现行选中项, 1))'
+$crossFormOwnerExpectedLine = '返回 (_启动窗口.左边 ＋ CrossFormProbe.宽度)'
 $additiveAssociativityLine = '返回 (10 ＋ 3 － 2)'
 $quotedConcatenationLine = '返回 (“第：” ＋ 到文本 (itemIndex) ＋ “条代理API异常请检查”)'
 $multiplicativeAssociativityLine = '返回 (24 × 3 ÷ 2)'
@@ -1370,6 +1412,7 @@ $crossControlSource2 = Join-Path $crossControlUnpacked2 "src\$crossControlClassN
 foreach ($crossControlSource in @($crossControlSource1, $crossControlSource2)) {
     $projection = [IO.File]::ReadAllText($crossControlSource)
     if (-not $projection.Contains($crossControlExpectedLine) -or
+        -not $projection.Contains($crossFormOwnerExpectedLine) -or
         -not $projection.Contains($additiveAssociativityLine) -or
         -not $projection.Contains($quotedConcatenationLine) -or
         -not $projection.Contains($quotedConcatenationLine + "`r`n`r`n`r`n.子程序 ProbeMultiplicativeAssociativity") -or
@@ -1405,8 +1448,44 @@ foreach ($crossControlUnpacked in @($crossControlUnpacked1, $crossControlUnpacke
         throw ('cross-form support member did not use canonical owner type 0x{0:X8}' -f $iextControlTypeId)
     }
     $symbolMap = Get-Content -LiteralPath (Join-Path $crossControlUnpacked 'project\.native_symbol_map.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+	$startFormSnapshot = @($symbolMap.forms | Where-Object { $_.name -eq $controlWindowName })[0]
+	$probeFormSnapshot = @($symbolMap.forms | Where-Object { $_.name -eq $crossControlFormName })[0]
+	if ($null -eq $startFormSnapshot -or $null -eq $probeFormSnapshot) {
+		throw 'cross-form native form identities missing'
+	}
+	$formOwnerMethod = @($nativeMap.methods | Where-Object { $_.name -eq 'ProbeCrossFormOwner' })[0]
+	if ($null -eq $formOwnerMethod) { throw 'cross-form owner native method snapshot missing' }
+	$formOwnerExpression = [Convert]::FromBase64String($formOwnerMethod.expressionData)
+	$formOwnerIds = @([int]$startFormSnapshot.id, [int]$probeFormSnapshot.id)
+	foreach ($formOwnerId in $formOwnerIds) {
+		$formOwnerCount = 0
+		for ($offset = 0; $offset + 8 -lt $formOwnerExpression.Length; $offset++) {
+			if ($formOwnerExpression[$offset] -eq 0x39 -and
+				[BitConverter]::ToInt32($formOwnerExpression, $offset + 5) -eq $formOwnerId) {
+				$formOwnerCount++
+			}
+		}
+		if ($formOwnerCount -ne 1) {
+			throw ('cross-form support member lost concrete form owner 0x{0:X8}' -f $formOwnerId)
+		}
+	}
+	$builtinFormOwnerCount = 0
+	for ($offset = 0; $offset + 8 -lt $formOwnerExpression.Length; $offset++) {
+		if ($formOwnerExpression[$offset] -eq 0x39 -and
+			[BitConverter]::ToInt32($formOwnerExpression, $offset + 5) -eq 0x00010001) {
+			$builtinFormOwnerCount++
+		}
+	}
+	if ($builtinFormOwnerCount -ne 0) {
+		throw 'cross-form support member encoded the support alias instead of the concrete form owner'
+	}
     $controlSnapshot = @($symbolMap.forms.elements | Where-Object { $_.name -eq '超级列表框1' })[0]
     if ($null -eq $controlSnapshot) { throw 'cross-form current control identity missing' }
+	if ([int]$controlSnapshot.dataType -ne $iextControlTypeId) {
+		throw ('cross-form current control used dependency slot type 0x{0:X8}, expected 0x{1:X8}' -f
+			[int]$controlSnapshot.dataType,
+			$iextControlTypeId)
+	}
     $crossControlIds.Add([int]$controlSnapshot.id)
 }
 if ($crossControlIds.Count -ne 2 -or $crossControlIds[0] -ne $crossControlIds[1]) {

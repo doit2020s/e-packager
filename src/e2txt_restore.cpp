@@ -2187,6 +2187,14 @@ public:
 			return 0;
 		}
 		if (const auto it = m_builtinTypes.find(typeName); it != m_builtinTypes.end()) {
+			// Library-backed builtins are fallback aliases from a historic dependency
+			// layout. Prefer the type loaded from this project's actual library slot.
+			if (epl_system_id::IsLibDataType(it->second)) {
+				std::int32_t supportTypeId = 0;
+				if (TryResolveLoadedSupportTypeId(typeName, supportTypeId)) {
+					return supportTypeId;
+				}
+			}
 			return it->second;
 		}
 		if (const auto it = m_userTypes.find(typeName); it != m_userTypes.end()) {
@@ -2196,6 +2204,19 @@ public:
 			return it->second.typeId;
 		}
 		return 0;
+	}
+
+	bool TryResolveLoadedSupportTypeId(
+		const std::string& rawTypeName,
+		std::int32_t& outTypeId) const
+	{
+		const auto it = m_supportTypes.find(NormalizeTypeName(rawTypeName));
+		if (it == m_supportTypes.end()) {
+			outTypeId = 0;
+			return false;
+		}
+		outTypeId = it->second.typeId;
+		return outTypeId != 0;
 	}
 
 	bool IsTabControlType(const std::int32_t typeId) const
@@ -4471,6 +4492,60 @@ struct NativeObjectMethodEncodeContext {
 	const TypeResolver* typeResolver = nullptr;
 };
 
+bool HasNonCanonicalAliasedMemberOwnerBinding(
+	const std::vector<std::uint8_t>& expressionData,
+	const std::vector<std::int32_t>& variableReferences,
+	const NativeObjectMethodEncodeContext& context)
+{
+	for (const std::int32_t reference : variableReferences) {
+		if (reference < 0) {
+			continue;
+		}
+		// Native variable references point at the expression wrapper in some method
+		// layouts and at the 0x38 variable opcode in others.
+		for (const size_t adjustment : { size_t{ 0 }, size_t{ 1 } }) {
+			const size_t variableOffset = static_cast<size_t>(reference) + adjustment;
+			if (variableOffset + 14 > expressionData.size() ||
+				expressionData[variableOffset] != 0x38 ||
+				expressionData[variableOffset + 5] != 0x39) {
+				continue;
+			}
+
+			std::int32_t concreteOwnerTypeId = 0;
+			std::int32_t encodedMemberOwnerTypeId = 0;
+			std::memcpy(
+				&concreteOwnerTypeId,
+				expressionData.data() + variableOffset + 1,
+				sizeof(concreteOwnerTypeId));
+			std::memcpy(
+				&encodedMemberOwnerTypeId,
+				expressionData.data() + variableOffset + 10,
+				sizeof(encodedMemberOwnerTypeId));
+			const auto aliasIt = context.supportMemberTypeByOwnerType.find(concreteOwnerTypeId);
+			if (aliasIt != context.supportMemberTypeByOwnerType.end() &&
+				aliasIt->second != concreteOwnerTypeId &&
+				encodedMemberOwnerTypeId == aliasIt->second) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool HasNonCanonicalAliasedMemberOwnerBinding(
+	const BundleNativeMethodSnapshot& nativeMethod,
+	const NativeObjectMethodEncodeContext& context)
+{
+	std::vector<std::int32_t> variableReferences;
+	if (!DecodeNativeLineOffsets(nativeMethod.variableReference, variableReferences)) {
+		return false;
+	}
+	return HasNonCanonicalAliasedMemberOwnerBinding(
+		nativeMethod.expressionData,
+		variableReferences,
+		context);
+}
+
 std::string BuildRawNativeConstantAlias(const std::int32_t id)
 {
 	std::string_view prefix;
@@ -5051,7 +5126,13 @@ bool TryResolveNativeMember(
 			rawMemberName,
 			memberId,
 			memberOwnerTypeId)) {
-		outMember = NativeObjectMemberSymbol{ memberId, memberOwnerTypeId, 0 };
+		// A project object such as a form can expose members through a support-type
+		// alias. The alias selects the public member table, but native expressions
+		// still identify the concrete object as the member owner.
+		outMember = NativeObjectMemberSymbol{
+			memberId,
+			aliasIt == context.supportMemberTypeByOwnerType.end() ? memberOwnerTypeId : ownerTypeId,
+			0 };
 		return true;
 	}
 
@@ -7107,6 +7188,16 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 			return std::nullopt;
 		}
 		if (matchedIndex == (std::numeric_limits<size_t>::max)()) {
+			return std::nullopt;
+		}
+		const auto& matchedSegment = originalSegments[matchedIndex];
+		if (HasNonCanonicalAliasedMemberOwnerBinding(
+				matchedSegment.data,
+				matchedSegment.variableReferences,
+				encodeContext)) {
+			// Text equality alone cannot prove that a saved member chain still owns
+			// the member with the concrete project object. Rebuild stale alias-bound
+			// lines while retaining the other native line segments.
 			return std::nullopt;
 		}
 		return matchedIndex;
@@ -9462,7 +9553,14 @@ struct NativeFormElementIdentityPool {
 		if (epl_system_id::GetType(id) != expectedType) {
 			return 0;
 		}
-		dataType = candidate.dataType;
+		std::int32_t loadedSupportType = 0;
+		const bool declaredTypeIsLoadedSupport =
+			resolver != nullptr &&
+			resolver->TryResolveLoadedSupportTypeId(rawDeclaredTypeName, loadedSupportType) &&
+			loadedSupportType == dataType;
+		if (!declaredTypeIsLoadedSupport) {
+			dataType = candidate.dataType;
+		}
 		used[index] = true;
 		if (provesHandlers) {
 			outHandlerEvidence = &candidate;
@@ -14367,14 +14465,26 @@ bool BuildRestoreModel(
 			const bool methodTextUnchanged =
 				originalParsedMethod != nullptr &&
 				AreParsedMethodsTextuallyEquivalent(parsedMethod, *originalParsedMethod);
+			const bool reusableNativeMethodBindingStable =
+				reusableNativeMethodSnapshot != nullptr &&
+				!HasNonCanonicalAliasedMemberOwnerBinding(
+					*reusableNativeMethodSnapshot,
+					nativeObjectEncodeContext);
+			const bool identityNativeMethodBindingStable =
+				identityNativeMethodSnapshot != nullptr &&
+				!HasNonCanonicalAliasedMemberOwnerBinding(
+					*identityNativeMethodSnapshot,
+					nativeObjectEncodeContext);
 			if (!preparedMethod.rebuildNativeCode &&
-				((reusableNativeMethodSnapshot != nullptr) ||
-				(canReuseIdentityNativeMethodSnapshot &&
-					methodTextUnchanged) ||
-				(preferNativeMethodSnapshots && identityNativeMethodSnapshot != nullptr &&
-					methodTextUnchanged))) {
+				(reusableNativeMethodBindingStable ||
+					(canReuseIdentityNativeMethodSnapshot &&
+						methodTextUnchanged &&
+						identityNativeMethodBindingStable) ||
+					(preferNativeMethodSnapshots &&
+						identityNativeMethodBindingStable &&
+						methodTextUnchanged))) {
 				const BundleNativeMethodSnapshot* nativeMethodSnapshot =
-					(reusableNativeMethodSnapshot != nullptr)
+					(reusableNativeMethodBindingStable)
 						? reusableNativeMethodSnapshot
 						: identityNativeMethodSnapshot;
 				method.lineOffset = nativeMethodSnapshot->lineOffset;
