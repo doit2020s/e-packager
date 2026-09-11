@@ -295,6 +295,7 @@ $programText = @'
 .局部变量 结果, 整数型
 .局部变量 动态数组, 整数型, , "0"
 结果 ＝ 接收数据 (到字节集 ({1, 2, 3}), 2)  ' 字节集参数与赋值注释
+结果 ＝ RT_GetTickCount (0)  ' 本地 DLL 命令必须在方法语义重建前注册
 .如果真 (结果 <> 0 且 结果 ％ 2 = 0)
     返回 (结果)  ' 分支返回注释
 .如果真结束
@@ -344,6 +345,35 @@ $unpacked2 = Join-Path $OutputRoot 'roundtrip-core-unpacked-2'
 Invoke-Packager @('pack', $consoleWorkspace, $candidate)
 Invoke-Packager @('unpack', $candidate, $unpacked1, '--main-only')
 Invoke-Packager @('compare-bundle', $candidate, $unpacked1)
+
+$nativeSourceMap = @(Get-Content -LiteralPath (Join-Path $unpacked1 'project\.native_source_map.json') -Raw -Encoding UTF8 |
+    ConvertFrom-Json)
+$nativeSymbolMap = Get-Content -LiteralPath (Join-Path $unpacked1 'project\.native_symbol_map.json') -Raw -Encoding UTF8 |
+    ConvertFrom-Json
+$dllSymbols = @($nativeSymbolMap.dlls | Where-Object { $_.name -eq 'RT_GetTickCount' })
+$startMethods = @($nativeSourceMap | ForEach-Object { $_.methods } |
+    Where-Object { $_.name -eq '_启动子程序' })
+if ($dllSymbols.Count -ne 1 -or $startMethods.Count -ne 1) {
+    throw 'local DLL regression evidence is missing or ambiguous'
+}
+$callData = [Convert]::FromBase64String([string]$startMethods[0].expressionData)
+$callReferences = [Convert]::FromBase64String([string]$startMethods[0].methodReference)
+$matchingDllCallCount = 0
+for ($offsetIndex = 0; $offsetIndex -lt $callReferences.Length; $offsetIndex += 4) {
+    $callOffset = [BitConverter]::ToInt32($callReferences, $offsetIndex)
+    if ($callOffset -lt 0 -or $callOffset + 7 -gt $callData.Length) {
+        continue
+    }
+    $methodId = [BitConverter]::ToInt32($callData, $callOffset + 1)
+    $libraryId = [BitConverter]::ToInt16($callData, $callOffset + 5)
+    if ($methodId -eq [int]$dllSymbols[0].id -and $libraryId -eq -3) {
+        ++$matchingDllCallCount
+    }
+}
+if ($matchingDllCallCount -ne 1) {
+    throw "local DLL call header must preserve the DLL id with library id -3: matches=$matchingDllCallCount"
+}
+
 Invoke-Packager @('pack', $unpacked1, $candidate2)
 Invoke-Packager @('unpack', $candidate2, $unpacked2, '--main-only')
 
@@ -360,6 +390,7 @@ $roundtripProgram = Get-ChildItem -LiteralPath (Join-Path $unpacked2 'src') -Fil
 $actualLines = @([IO.File]::ReadAllLines($roundtripProgram.FullName) | ForEach-Object { Normalize-Line $_ })
 $requiredLines = @(
     '结果 = 接收数据 (到字节集 ({1, 2, 3}), 2)  '' 字节集参数与赋值注释',
+    '结果 = RT_GetTickCount (0)  '' 本地 DLL 命令必须在方法语义重建前注册',
     '.如果真 (结果 != 0 且 结果 % 2 = 0)',
     '返回 (结果)  '' 分支返回注释',
     '返回 (0)  '' 尾部返回必须保留'

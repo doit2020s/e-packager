@@ -10942,6 +10942,8 @@ bool BuildRestoreModel(
 	localGlobalModelIndices.reserve(parsedGlobals.size());
 	std::vector<size_t> localDllModelIndices;
 	localDllModelIndices.reserve(parsedDlls.size());
+	std::vector<const BundleNativeDllSnapshot*> nativeDllSnapshotsByIndex(parsedDlls.size(), nullptr);
+	std::vector<std::int32_t> localDllIds(parsedDlls.size(), 0);
 	std::vector<size_t> localConstantModelIndices;
 	localConstantModelIndices.reserve(parsedConstants.size());
 	std::vector<std::int32_t> localConstantIds(parsedConstants.size(), 0);
@@ -13925,6 +13927,20 @@ bool BuildRestoreModel(
 		changedStructNativeReferenceIds.begin(),
 		changedStructNativeReferenceIds.end());
 
+	// DLL declarations must own stable IDs before local method bodies are encoded.
+	// A semantic rebuild can call a local DLL command, and native call headers use
+	// library id -3 with the DLL declaration id. Building the declarations after
+	// methods without this preparation makes every such call unresolved.
+	for (size_t dllIndex = 0; dllIndex < parsedDlls.size(); ++dllIndex) {
+		const BundleNativeDllSnapshot* reusableDllSnapshot =
+			findReusableDllSnapshot(parsedDlls[dllIndex]);
+		nativeDllSnapshotsByIndex[dllIndex] = reusableDllSnapshot;
+		localDllIds[dllIndex] =
+			reusableDllSnapshot != nullptr && reusableDllSnapshot->id != 0
+				? reusableDllSnapshot->id
+				: allocator.Alloc(epl_system_id::kTypeDll);
+	}
+
 	for (size_t constantIndex = 0; constantIndex < parsedConstants.size(); ++constantIndex) {
 		const BundleNativeConstantSnapshot* reusableConstantSnapshot =
 			findReusableValueConstantSnapshot(parsedConstants[constantIndex]);
@@ -14558,6 +14574,25 @@ bool BuildRestoreModel(
 						TypeResolver::NormalizeTypeName(existingMethod.name),
 						NativeFunctionSymbol{ -2, existingMethod.id });
 			}
+			for (const auto& existingDll : model.dlls) {
+				if (existingDll.id == 0 || existingDll.name.empty()) {
+					continue;
+				}
+				const std::string dllKey = TypeResolver::NormalizeTypeName(existingDll.name);
+				nativeObjectEncodeContext.functionsByName.try_emplace(
+					dllKey,
+					NativeFunctionSymbol{ -3, existingDll.id });
+			}
+			for (size_t dllIndex = 0; dllIndex < parsedDlls.size(); ++dllIndex) {
+				if (localDllIds[dllIndex] == 0 || parsedDlls[dllIndex].name.empty()) {
+					continue;
+				}
+				const std::string dllKey =
+					TypeResolver::NormalizeTypeName(parsedDlls[dllIndex].name);
+				nativeObjectEncodeContext.functionsByName.insert_or_assign(
+					dllKey,
+					NativeFunctionSymbol{ -3, localDllIds[dllIndex] });
+			}
 			for (size_t sourceClassIndex = 0; sourceClassIndex < parsedClasses.size(); ++sourceClassIndex) {
 				const auto& sourceClass = parsedClasses[sourceClassIndex];
 				const std::int32_t sourceOwnerTypeId = model.classes[localClassModelIndices[sourceClassIndex]].id;
@@ -14741,13 +14776,12 @@ bool BuildRestoreModel(
 		}
 	}
 
-	for (const auto& parsedDll : parsedDlls) {
-		const BundleNativeDllSnapshot* reusableDllSnapshot = findReusableDllSnapshot(parsedDll);
+	for (size_t dllIndex = 0; dllIndex < parsedDlls.size(); ++dllIndex) {
+		const auto& parsedDll = parsedDlls[dllIndex];
+		const BundleNativeDllSnapshot* reusableDllSnapshot =
+			nativeDllSnapshotsByIndex[dllIndex];
 		RestoreDll dll;
-		dll.id =
-			reusableDllSnapshot != nullptr && reusableDllSnapshot->id != 0
-			? reusableDllSnapshot->id
-			: allocator.Alloc(epl_system_id::kTypeDll);
+		dll.id = localDllIds[dllIndex];
 		dll.memoryAddress = reusableDllSnapshot != nullptr ? reusableDllSnapshot->memoryAddress : 0;
 		dll.attr = parsedDll.isPublic ? 0x2 : 0;
 		dll.returnType =
