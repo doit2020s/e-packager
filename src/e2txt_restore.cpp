@@ -14553,6 +14553,29 @@ bool BuildRestoreModel(
 					if (sourceMethodKey.empty()) {
 						continue;
 					}
+					// A normal .e workspace may intentionally remove or change a method.
+					// Its stale native snapshot remains identity evidence, but must not make
+					// the removed name callable while rebuilding another method. EC bridge
+					// sources can omit private native methods from their public projection,
+					// so retain the complete snapshot catalog for that specialized path.
+					if (bundle == nullptr || bundle->sourceFileKind != SourceFileKind::EC) {
+						bool currentMethodStillOwnsSnapshot = false;
+						if (sourceClassIndex < preparedLocalMethods.size()) {
+							const size_t currentMethodCount = (std::min)(
+								parsedClasses[sourceClassIndex].methods.size(),
+								preparedLocalMethods[sourceClassIndex].size());
+							for (size_t currentMethodIndex = 0; currentMethodIndex < currentMethodCount; ++currentMethodIndex) {
+								if (preparedLocalMethods[sourceClassIndex][currentMethodIndex].id == sourceMethodSnapshot.id &&
+									TypeResolver::NormalizeTypeName(parsedClasses[sourceClassIndex].methods[currentMethodIndex].name) == sourceMethodKey) {
+									currentMethodStillOwnsSnapshot = true;
+									break;
+								}
+							}
+						}
+						if (!currentMethodStillOwnsSnapshot) {
+							continue;
+						}
+					}
 					const NativeFunctionSymbol sourceMethodSymbol{ -2, sourceMethodSnapshot.id };
 					nativeObjectEncodeContext.functionNamesById.insert_or_assign(
 						sourceMethodSnapshot.id,
@@ -14655,6 +14678,7 @@ bool BuildRestoreModel(
 				AreParsedMethodsTextuallyEquivalent(parsedMethod, *originalParsedMethod);
 			const bool reusableNativeMethodBindingStable =
 				reusableNativeMethodSnapshot != nullptr &&
+				HasStableNativeMethodVariableLayout(method, *reusableNativeMethodSnapshot) &&
 				!HasNonCanonicalAliasedMemberOwnerBinding(
 					*reusableNativeMethodSnapshot,
 					nativeObjectEncodeContext);
@@ -14669,6 +14693,7 @@ bool BuildRestoreModel(
 						methodTextUnchanged &&
 						identityNativeMethodBindingStable) ||
 					(preferNativeMethodSnapshots &&
+						canReuseIdentityNativeMethodSnapshot &&
 						identityNativeMethodBindingStable &&
 						methodTextUnchanged))) {
 				const BundleNativeMethodSnapshot* nativeMethodSnapshot =
@@ -14692,6 +14717,25 @@ bool BuildRestoreModel(
 			else if (identityNativeMethodSnapshot != nullptr) {
 				std::string semanticError;
 				std::string reusableLineError;
+				std::unordered_set<std::int32_t> methodInvalidNativeReferenceIds =
+					invalidNativeReferenceIds;
+				std::unordered_set<std::int32_t> currentMethodVariableIds;
+				for (const auto& param : method.params) {
+					if (param.id != 0) currentMethodVariableIds.insert(param.id);
+				}
+				for (const auto& local : method.locals) {
+					if (local.id != 0) currentMethodVariableIds.insert(local.id);
+				}
+				for (const std::int32_t nativeId : identityNativeMethodSnapshot->paramIds) {
+					if (nativeId != 0 && !currentMethodVariableIds.contains(nativeId)) {
+						methodInvalidNativeReferenceIds.insert(nativeId);
+					}
+				}
+				for (const std::int32_t nativeId : identityNativeMethodSnapshot->localIds) {
+					if (nativeId != 0 && !currentMethodVariableIds.contains(nativeId)) {
+						methodInvalidNativeReferenceIds.insert(nativeId);
+					}
+				}
 				const bool rebuiltWithReusableNativeLines =
 					!changedClassKinds[classIndex] &&
 					originalParsedMethod != nullptr &&
@@ -14701,7 +14745,7 @@ bool BuildRestoreModel(
 						*identityNativeMethodSnapshot,
 						method,
 						nativeObjectEncodeContext,
-						invalidNativeReferenceIds,
+						methodInvalidNativeReferenceIds,
 						&reusableLineError);
 				const bool rebuiltWithSemantic =
 					!rebuiltWithReusableNativeLines &&

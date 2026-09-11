@@ -644,6 +644,46 @@ if ($unqualifiedObjectExitCode -eq 0 -or
     -not $unqualifiedObjectOutput.Contains('function_not_found: ProbeObjectMethod')) {
     throw "bare call to an external object-class method did not fail closed: exit=$unqualifiedObjectExitCode output=$unqualifiedObjectOutput"
 }
+
+# Reusing an unchanged statement must not retain a local-variable id after the
+# variable is moved to assembly scope. The text of the call is unchanged, so this
+# specifically exercises native line-segment reuse and its reference invalidation.
+$objectScopeWorkspace = Join-Path $OutputRoot 'object-method-scope-change-workspace'
+Copy-Item -LiteralPath $objectMethodUnpacked -Destination $objectScopeWorkspace -Recurse
+$objectScopeHostPath = Get-ChildItem -LiteralPath (Join-Path $objectScopeWorkspace 'src') -Filter '*.txt' -File |
+    Where-Object { [IO.File]::ReadAllText($_.FullName).Contains('ProbeQualifiedObjectCall') } |
+    Select-Object -First 1
+if ($null -eq $objectScopeHostPath) {
+    throw 'object-method scope-change host source page is missing'
+}
+$objectScopeHostText = [IO.File]::ReadAllText($objectScopeHostPath.FullName)
+$objectScopeHostText = $objectScopeHostText.Replace(
+    '.程序集 ObjectMethodHost',
+    ".程序集 ObjectMethodHost`r`n.程序集变量 obj, ObjectMethodProbe")
+$objectScopeHostText = $objectScopeHostText.Replace(
+    ".局部变量 obj, ObjectMethodProbe`r`n",
+    '')
+Write-EText $objectScopeHostPath.FullName $objectScopeHostText
+$objectScopeCandidate = Join-Path $OutputRoot 'object-method-scope-change.e'
+$objectScopeUnpacked = Join-Path $OutputRoot 'object-method-scope-change-unpacked'
+Invoke-Packager @('pack', $objectScopeWorkspace, $objectScopeCandidate)
+Invoke-Packager @('unpack', $objectScopeCandidate, $objectScopeUnpacked, '--main-only')
+$objectScopeNativeMap = @(Get-Content -LiteralPath (Join-Path $objectScopeUnpacked 'project\.native_source_map.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
+$objectScopeHostSnapshot = @($objectScopeNativeMap | Where-Object { 'ProbeQualifiedObjectCall' -in $_.methods.name })[0]
+$objectScopeCallMethod = @($objectScopeHostSnapshot.methods | Where-Object { $_.name -eq 'ProbeQualifiedObjectCall' })[0]
+if ($null -eq $objectScopeHostSnapshot -or $null -eq $objectScopeCallMethod -or
+    @($objectScopeHostSnapshot.classVarIds).Count -ne 1) {
+    throw 'object-method scope-change native evidence is missing'
+}
+$oldObjectLocalId = [int]$objectQualifiedCallMethod.localIds[0]
+$assemblyObjectId = [int]$objectScopeHostSnapshot.classVarIds[0]
+$objectScopeExpression = [Convert]::FromBase64String($objectScopeCallMethod.expressionData)
+$oldLocalTarget = [byte[]](@(0x38) + [BitConverter]::GetBytes($oldObjectLocalId) + @(0x37))
+$assemblyTarget = [byte[]](@(0x38) + [BitConverter]::GetBytes($assemblyObjectId) + @(0x37))
+if ((Get-NativeByteSequenceCount $objectScopeExpression $oldLocalTarget) -ne 0 -or
+    (Get-NativeByteSequenceCount $objectScopeExpression $assemblyTarget) -ne 1) {
+    throw 'object-method scope change retained a stale local target id'
+}
 $kindNativeMapPath = Join-Path $kindProjection 'project\.native_source_map.json'
 $kindNativeMap = @(Get-Content -LiteralPath $kindNativeMapPath -Raw -Encoding UTF8 | ConvertFrom-Json)
 $kindNativeProbe = @($kindNativeMap | Where-Object { 'ProbeValue' -in $_.methods.name })[0]
@@ -799,6 +839,44 @@ if (@($inventoryOutput.methods).Count -ne (@($inventoryProbe.methods).Count + 1)
 $inventoryOutputSplit = @($inventoryOutput.methods | Where-Object { $_.name -eq 'ProbeSplitValue' })[0]
 if ($inventoryOutputSplit.expressionData -ne $injectedSplitExpression) {
     throw 'class method inventory change rebuilt an unrelated exact method payload'
+}
+
+# Removing a local method invalidates its native ID everywhere. An unchanged
+# caller must be rebuilt and rejected by name resolution instead of silently
+# retaining a call to the removed ID from its old expression snapshot.
+$removedMethodSeedWorkspace = Join-Path $OutputRoot 'removed-method-seed-workspace'
+Copy-Item -LiteralPath $kindProjection -Destination $removedMethodSeedWorkspace -Recurse
+$removedMethodSource = Join-Path $removedMethodSeedWorkspace 'src\ProbeGroup\CategoryProbe.txt'
+$removedMethodSeedText = [IO.File]::ReadAllText($removedMethodSource) + @'
+
+.子程序 ProbeRemovedTarget, 整数型, 公开
+
+返回 (23)
+
+.子程序 ProbeRemovedCaller, 整数型, 公开
+
+返回 (ProbeRemovedTarget ())
+'@
+Write-EText $removedMethodSource $removedMethodSeedText
+$removedMethodSeedCandidate = Join-Path $OutputRoot 'removed-method-seed.e'
+$removedMethodSeedUnpacked = Join-Path $OutputRoot 'removed-method-seed-unpacked'
+Invoke-Packager @('pack', $removedMethodSeedWorkspace, $removedMethodSeedCandidate)
+Invoke-Packager @('unpack', $removedMethodSeedCandidate, $removedMethodSeedUnpacked, '--main-only')
+$removedMethodWorkspace = Join-Path $OutputRoot 'removed-method-workspace'
+Copy-Item -LiteralPath $removedMethodSeedUnpacked -Destination $removedMethodWorkspace -Recurse
+$removedMethodSource = Join-Path $removedMethodWorkspace 'src\ProbeGroup\CategoryProbe.txt'
+$removedMethodText = [IO.File]::ReadAllText($removedMethodSource)
+$removedMethodText = [regex]::Replace(
+    $removedMethodText,
+    '(?ms)^\.子程序 ProbeRemovedTarget.*?(?=^\.子程序 ProbeRemovedCaller)',
+    '')
+Write-EText $removedMethodSource $removedMethodText
+$removedMethodCandidate = Join-Path $OutputRoot 'removed-method.e'
+$removedMethodOutput = & $Packager pack $removedMethodWorkspace $removedMethodCandidate 2>&1 | Out-String
+$removedMethodExitCode = $LASTEXITCODE
+if ($removedMethodExitCode -eq 0 -or
+    -not $removedMethodOutput.Contains('function_not_found: ProbeRemovedTarget')) {
+    throw "removed method reference did not fail closed: exit=$removedMethodExitCode output=$removedMethodOutput"
 }
 
 # A data-type shape change keeps the owner and declaration-identical member
@@ -1998,9 +2076,12 @@ $result = [ordered]@{
 	header_kind_ordinary_second_projection_sha256 = $secondOrdinaryProjectionHash.ToLowerInvariant()
 	header_kind_roundtrip_stable = $true
 	header_kind_untrusted_snapshot_repaired = $true
+	removed_method_reference_rejected = $true
 	object_method_self_call_id = ('0x{0:X8}' -f [int]$objectMethod.id)
 	object_method_qualified_call_bound = $true
 	object_method_unqualified_external_call_rejected = $true
+	object_method_scope_change_target_id = ('0x{0:X8}' -f $assemblyObjectId)
+	object_method_scope_change_stale_local_rejected = $true
 	same_name_function_ids = $sharedBindingIds[0]
 	stale_same_name_snapshot_repaired = $true
 	semantic_true_encoding = '0xFFFF'
