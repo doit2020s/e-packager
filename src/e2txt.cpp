@@ -4729,12 +4729,14 @@ struct Expr {
 	ExprKind kind = ExprKind::DefaultValue;
 	double numberValue = 0.0;
 	bool boolValue = false;
+	std::int16_t boolRawValue = 0;
 	std::int32_t intValue1 = 0;
 	std::int32_t intValue2 = 0;
 	std::int32_t intValue3 = 0;
 	std::int16_t shortValue1 = 0;
 	std::int16_t shortValue2 = 0;
 	bool flagValue = false;
+	size_t sourceOffset = 0;
 	std::string text;
 	std::unique_ptr<Expr> target;
 	std::unique_ptr<Expr> extra;
@@ -5072,7 +5074,9 @@ bool ParseExpression(ByteReader& reader, std::unique_ptr<Expr>& outExpr, std::st
 	outExpr.reset();
 
 	std::uint8_t type = 0;
+	size_t typeOffset = 0;
 	while (true) {
+		typeOffset = reader.position();
 		if (!reader.ReadU8(type)) {
 			if (outError != nullptr) {
 				*outError = "expression_type_read_failed";
@@ -5085,6 +5089,7 @@ bool ParseExpression(ByteReader& reader, std::unique_ptr<Expr>& outExpr, std::st
 	}
 
 	auto expr = std::make_unique<Expr>();
+	expr->sourceOffset = typeOffset;
 	switch (type) {
 	case 0x01:
 		expr->kind = ExprKind::ParamListEnd;
@@ -5111,6 +5116,7 @@ bool ParseExpression(ByteReader& reader, std::unique_ptr<Expr>& outExpr, std::st
 			return false;
 		}
 		expr->boolValue = raw != 0;
+		expr->boolRawValue = raw;
 		break;
 	}
 	case 0x19:
@@ -8483,6 +8489,48 @@ std::string ComputeBundleDigestInternal(const ProjectBundle& bundle, const bool 
 	return writer.FinishHex();
 }
 
+void CollectNonCanonicalNativeTrueLiteralOffsets(
+	const Expr* expression,
+	std::vector<size_t>& outOffsets)
+{
+	if (expression == nullptr) {
+		return;
+	}
+	if (expression->kind == ExprKind::Bool &&
+		expression->boolValue &&
+		expression->boolRawValue != static_cast<std::int16_t>(-1)) {
+		outOffsets.push_back(expression->sourceOffset);
+	}
+	CollectNonCanonicalNativeTrueLiteralOffsets(expression->target.get(), outOffsets);
+	CollectNonCanonicalNativeTrueLiteralOffsets(expression->extra.get(), outOffsets);
+	for (const auto& item : expression->items) {
+		CollectNonCanonicalNativeTrueLiteralOffsets(item.get(), outOffsets);
+	}
+}
+
+void CollectNonCanonicalNativeTrueLiteralOffsets(
+	const StatementBlock* block,
+	std::vector<size_t>& outOffsets)
+{
+	if (block == nullptr) {
+		return;
+	}
+	for (const auto& statement : block->items) {
+		CollectNonCanonicalNativeTrueLiteralOffsets(statement.expression.get(), outOffsets);
+		CollectNonCanonicalNativeTrueLiteralOffsets(statement.condition.get(), outOffsets);
+		CollectNonCanonicalNativeTrueLiteralOffsets(statement.expr2.get(), outOffsets);
+		CollectNonCanonicalNativeTrueLiteralOffsets(statement.expr3.get(), outOffsets);
+		CollectNonCanonicalNativeTrueLiteralOffsets(statement.expr4.get(), outOffsets);
+		CollectNonCanonicalNativeTrueLiteralOffsets(statement.block.get(), outOffsets);
+		CollectNonCanonicalNativeTrueLiteralOffsets(statement.elseBlock.get(), outOffsets);
+		CollectNonCanonicalNativeTrueLiteralOffsets(statement.defaultBlock.get(), outOffsets);
+		for (const auto& caseItem : statement.switchCases) {
+			CollectNonCanonicalNativeTrueLiteralOffsets(caseItem.condition.get(), outOffsets);
+			CollectNonCanonicalNativeTrueLiteralOffsets(caseItem.block.get(), outOffsets);
+		}
+	}
+}
+
 }  // namespace
 
 std::string ComputeBundleDigest(const ProjectBundle& bundle)
@@ -8567,6 +8615,53 @@ bool ValidateNativeMethodBodyBytes(
 			*outError = stream.str();
 		}
 		return false;
+	}
+	return true;
+}
+
+bool NormalizeNativeMethodBooleanLiterals(
+	std::vector<std::uint8_t>& expressionData,
+	size_t& outNormalizedCount,
+	std::string* outError)
+{
+	outNormalizedCount = 0;
+	if (outError != nullptr) {
+		outError->clear();
+	}
+	if (expressionData.empty()) {
+		return true;
+	}
+
+	ByteReader reader(expressionData);
+	std::unique_ptr<StatementBlock> block;
+	std::string parseError;
+	if (!ParseStatementBlock(reader, block, &parseError, false) || block == nullptr) {
+		if (outError != nullptr) {
+			*outError = parseError.empty() ? "function_body_parse_failed" : parseError;
+		}
+		return false;
+	}
+	if (reader.position() != expressionData.size()) {
+		if (outError != nullptr) {
+			std::ostringstream stream;
+			stream << "function_body_trailing_bytes@0x" << std::hex << std::uppercase
+				<< reader.position();
+			*outError = stream.str();
+		}
+		return false;
+	}
+	std::vector<size_t> offsets;
+	CollectNonCanonicalNativeTrueLiteralOffsets(block.get(), offsets);
+	for (const size_t offset : offsets) {
+		if (offset + 2 >= expressionData.size() || expressionData[offset] != 0x18) {
+			if (outError != nullptr) {
+				*outError = "bool_literal_offset_invalid";
+			}
+			return false;
+		}
+		expressionData[offset + 1] = 0xFF;
+		expressionData[offset + 2] = 0xFF;
+		++outNormalizedCount;
 	}
 	return true;
 }

@@ -5841,7 +5841,7 @@ bool TryEncodeNativeExpression(
 
 	if (const auto boolValue = ParseBoolLiteral(expression); boolValue.has_value()) {
 		writer.WriteU8(0x18);
-		writer.WriteI16(static_cast<std::int16_t>(*boolValue ? 1 : 0));
+		writer.WriteI16(*boolValue ? static_cast<std::int16_t>(-1) : static_cast<std::int16_t>(0));
 		return true;
 	}
 
@@ -14493,17 +14493,32 @@ bool BuildRestoreModel(
 				method.variableReference = nativeMethodSnapshot->variableReference;
 				method.constantReference = nativeMethodSnapshot->constantReference;
 				method.expressionData = nativeMethodSnapshot->expressionData;
+				size_t normalizedBooleanCount = 0;
+				// Historical snapshots may contain valid opcodes that the public parser
+				// does not yet understand. Preserve those snapshots byte-for-byte; only
+				// normalize after the entire method body has been parsed successfully.
+				(void)e2txt::NormalizeNativeMethodBooleanLiterals(
+					method.expressionData,
+					normalizedBooleanCount,
+					nullptr);
 			}
 			else if (identityNativeMethodSnapshot != nullptr) {
 				std::string semanticError;
 				std::string reusableLineError;
+				BundleNativeMethodSnapshot normalizedIdentityNativeMethodSnapshot =
+					*identityNativeMethodSnapshot;
+				size_t normalizedBooleanCount = 0;
+				(void)e2txt::NormalizeNativeMethodBooleanLiterals(
+					normalizedIdentityNativeMethodSnapshot.expressionData,
+					normalizedBooleanCount,
+					nullptr);
 				const bool rebuiltWithReusableNativeLines =
 					!changedClassKinds[classIndex] &&
 					originalParsedMethod != nullptr &&
 					TryBuildMethodCodeDataWithReusableNativeLineSegments(
 						parsedMethod.bodyLines,
 						originalParsedMethod->bodyLines,
-						*identityNativeMethodSnapshot,
+						normalizedIdentityNativeMethodSnapshot,
 						method,
 						nativeObjectEncodeContext,
 						invalidNativeReferenceIds,

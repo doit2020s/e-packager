@@ -1325,7 +1325,18 @@ $crossControlClassText = @'
 
 .子程序 ProbeCrossFormOwner, 整数型
 
-返回 (_启动窗口.左边 ＋ CrossFormProbe.宽度)
+.如果真 (真)
+    返回 (_启动窗口.左边 ＋ CrossFormProbe.宽度)
+.如果真结束
+返回 (0)
+
+.子程序 ProbeBooleanTrue, 逻辑型
+
+返回 (真)
+
+.子程序 ProbeBooleanFalse, 逻辑型
+
+返回 (假)
 
 .子程序 ProbeAdditiveAssociativity, 整数型
 
@@ -1396,7 +1407,37 @@ for ($offset = 0; $offset + 8 -lt $staleOwnerExpression.Length; $offset++) {
 if ($staleOwnerRewriteCount -ne 2) {
 	throw "cross-form stale-owner fixture rewrite mismatch: $staleOwnerRewriteCount"
 }
+$staleOwnerTrueRewriteCount = 0
+for ($offset = 0; $offset + 2 -lt $staleOwnerExpression.Length; $offset++) {
+	if ($staleOwnerExpression[$offset] -eq 0x18 -and
+		$staleOwnerExpression[$offset + 1] -eq 0xFF -and
+		$staleOwnerExpression[$offset + 2] -eq 0xFF) {
+		$staleOwnerExpression[$offset + 1] = 0x01
+		$staleOwnerExpression[$offset + 2] = 0x00
+		$staleOwnerTrueRewriteCount++
+	}
+}
+if ($staleOwnerTrueRewriteCount -ne 1) {
+	throw "cross-form stale-owner boolean fixture rewrite mismatch: $staleOwnerTrueRewriteCount"
+}
 $staleOwnerMethod.expressionData = [Convert]::ToBase64String($staleOwnerExpression)
+$staleTrueMethod = @($staleOwnerNativeMap.methods | Where-Object { $_.name -eq 'ProbeBooleanTrue' })[0]
+if ($null -eq $staleTrueMethod) { throw 'native boolean stale fixture method missing' }
+$staleTrueExpression = [Convert]::FromBase64String($staleTrueMethod.expressionData)
+$staleTrueRewriteCount = 0
+for ($offset = 0; $offset + 2 -lt $staleTrueExpression.Length; $offset++) {
+	if ($staleTrueExpression[$offset] -eq 0x18 -and
+		$staleTrueExpression[$offset + 1] -eq 0xFF -and
+		$staleTrueExpression[$offset + 2] -eq 0xFF) {
+		$staleTrueExpression[$offset + 1] = 0x01
+		$staleTrueExpression[$offset + 2] = 0x00
+		$staleTrueRewriteCount++
+	}
+}
+if ($staleTrueRewriteCount -ne 1) {
+	throw "native boolean stale fixture rewrite mismatch: $staleTrueRewriteCount"
+}
+$staleTrueMethod.expressionData = [Convert]::ToBase64String($staleTrueExpression)
 Write-EText $staleOwnerNativeMapPath ((ConvertTo-Json -InputObject $staleOwnerNativeMap -Depth 100) + "`r`n")
 Invoke-Packager @('pack', $crossControlStaleOwnerWorkspace, $crossControlCandidate2)
 Invoke-Packager @('unpack', $crossControlCandidate2, $crossControlUnpacked2, '--main-only')
@@ -1404,6 +1445,8 @@ Invoke-Packager @('compare-bundle', $crossControlCandidate2, $crossControlUnpack
 
 $crossControlExpectedLine = '返回 (_启动窗口.超级列表框1.取标题 (_启动窗口.超级列表框1.现行选中项, 1))'
 $crossFormOwnerExpectedLine = '返回 (_启动窗口.左边 ＋ CrossFormProbe.宽度)'
+$booleanTrueExpectedLine = '返回 (真)'
+$booleanFalseExpectedLine = '返回 (假)'
 $additiveAssociativityLine = '返回 (10 ＋ 3 － 2)'
 $quotedConcatenationLine = '返回 (“第：” ＋ 到文本 (itemIndex) ＋ “条代理API异常请检查”)'
 $multiplicativeAssociativityLine = '返回 (24 × 3 ÷ 2)'
@@ -1413,6 +1456,8 @@ foreach ($crossControlSource in @($crossControlSource1, $crossControlSource2)) {
     $projection = [IO.File]::ReadAllText($crossControlSource)
     if (-not $projection.Contains($crossControlExpectedLine) -or
         -not $projection.Contains($crossFormOwnerExpectedLine) -or
+        -not $projection.Contains($booleanTrueExpectedLine) -or
+        -not $projection.Contains($booleanFalseExpectedLine) -or
         -not $projection.Contains($additiveAssociativityLine) -or
         -not $projection.Contains($quotedConcatenationLine) -or
         -not $projection.Contains($quotedConcatenationLine + "`r`n`r`n`r`n.子程序 ProbeMultiplicativeAssociativity") -or
@@ -1436,6 +1481,9 @@ $crossControlCanonicalMember = [byte[]](@(0x39) +
 $crossControlLegacyMember = [byte[]](@(0x39) +
     [BitConverter]::GetBytes([int]36) +
     [BitConverter]::GetBytes([int]196612))
+$canonicalTrueLiteral = [byte[]](0x18, 0xFF, 0xFF)
+$positiveTrueLiteral = [byte[]](0x18, 0x01, 0x00)
+$canonicalFalseLiteral = [byte[]](0x18, 0x00, 0x00)
 $crossControlIds = [Collections.Generic.List[int]]::new()
 foreach ($crossControlUnpacked in @($crossControlUnpacked1, $crossControlUnpacked2)) {
     $nativeMap = @(Get-Content -LiteralPath (Join-Path $crossControlUnpacked 'project\.native_source_map.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
@@ -1447,6 +1495,18 @@ foreach ($crossControlUnpacked in @($crossControlUnpacked1, $crossControlUnpacke
         (Get-NativeByteSequenceCount $expression $crossControlLegacyMember) -ne 0) {
         throw ('cross-form support member did not use canonical owner type 0x{0:X8}' -f $iextControlTypeId)
     }
+	$booleanTrueMethod = @($nativeMap.methods | Where-Object { $_.name -eq 'ProbeBooleanTrue' })[0]
+	$booleanFalseMethod = @($nativeMap.methods | Where-Object { $_.name -eq 'ProbeBooleanFalse' })[0]
+	if ($null -eq $booleanTrueMethod -or $null -eq $booleanFalseMethod) {
+		throw 'native boolean regression methods missing'
+	}
+	$booleanTrueExpression = [Convert]::FromBase64String($booleanTrueMethod.expressionData)
+	$booleanFalseExpression = [Convert]::FromBase64String($booleanFalseMethod.expressionData)
+	if ((Get-NativeByteSequenceCount $booleanTrueExpression $canonicalTrueLiteral) -ne 1 -or
+		(Get-NativeByteSequenceCount $booleanTrueExpression $positiveTrueLiteral) -ne 0 -or
+		(Get-NativeByteSequenceCount $booleanFalseExpression $canonicalFalseLiteral) -ne 1) {
+		throw 'native boolean literal encoding is not canonical -1/0'
+	}
     $symbolMap = Get-Content -LiteralPath (Join-Path $crossControlUnpacked 'project\.native_symbol_map.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 	$startFormSnapshot = @($symbolMap.forms | Where-Object { $_.name -eq $controlWindowName })[0]
 	$probeFormSnapshot = @($symbolMap.forms | Where-Object { $_.name -eq $crossControlFormName })[0]
@@ -1478,6 +1538,10 @@ foreach ($crossControlUnpacked in @($crossControlUnpacked1, $crossControlUnpacke
 	}
 	if ($builtinFormOwnerCount -ne 0) {
 		throw 'cross-form support member encoded the support alias instead of the concrete form owner'
+	}
+	if ((Get-NativeByteSequenceCount $formOwnerExpression $canonicalTrueLiteral) -ne 1 -or
+		(Get-NativeByteSequenceCount $formOwnerExpression $positiveTrueLiteral) -ne 0) {
+		throw 'reusable native line rebuild did not canonicalize a true literal'
 	}
     $controlSnapshot = @($symbolMap.forms.elements | Where-Object { $_.name -eq '超级列表框1' })[0]
     if ($null -eq $controlSnapshot) { throw 'cross-form current control identity missing' }

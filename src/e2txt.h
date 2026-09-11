@@ -481,6 +481,11 @@ bool ExtractNativeDependencySymbols(
 bool ValidateNativeMethodBodyBytes(
 	const std::vector<std::uint8_t>& expressionData,
 	std::string* outError);
+// 解析原生方法体并将所有非零“真”字面量规范化为 E 5.9 使用的 -1。
+bool NormalizeNativeMethodBooleanLiterals(
+	std::vector<std::uint8_t>& expressionData,
+	size_t& outNormalizedCount,
+	std::string* outError);
 // 计算原生方法体中一条语句调用自身的自然结束偏移，不包含其后的块标记。
 bool TryMeasureNativeStatementEndOffset(
 	const std::vector<std::uint8_t>& expressionData,
