@@ -14203,7 +14203,22 @@ bool BuildRestoreModel(
 			}
 			if (prepared.identityMatch.snapshot != nullptr && prepared.identityMatch.snapshot->id != 0) {
 				prepared.id = prepared.identityMatch.snapshot->id;
-				prepared.memoryAddress = prepared.identityMatch.snapshot->memoryAddress;
+				const bool methodExecutableUnchanged =
+					prepared.identityMatch.originalParsedMethod != nullptr
+						? (AreParsedMethodsCodeEquivalent(
+								parsedMethod,
+								*prepared.identityMatch.originalParsedMethod) ||
+							AreParsedMethodsExecutableEquivalentWithTrailingLocals(
+								parsedMethod,
+								*prepared.identityMatch.originalParsedMethod))
+						: prepared.identityMatch.snapshot->textDigest == ComputeParsedMethodDigest(parsedMethod);
+				prepared.memoryAddress =
+					!changedClassShapes[classIndex] &&
+					!changedClassMethodInventories[classIndex] &&
+					!prepared.rebuildNativeCode &&
+					methodExecutableUnchanged
+						? prepared.identityMatch.snapshot->memoryAddress
+						: 0;
 			}
 			else {
 				prepared.id = allocator.Alloc(epl_system_id::kTypeMethod);

@@ -840,6 +840,38 @@ if (@($staticShapeOutput.classVarIds).Count -ne 1 -or
     throw 'static class shape change did not encode the new class-variable access'
 }
 
+# Changing executable method text invalidates its saved native code address even
+# when the declaration and owner layout remain compatible. Keep the method ID for
+# callers, but force E 5.9 to compile fresh code for the changed body.
+$staticMethodOriginal = Get-SnapshotByMethod $kindProjection '_启动子程序'
+$staticMethodOriginalBody = @($staticMethodOriginal.methods | Where-Object { $_.name -eq '_启动子程序' })[0]
+if ($staticMethodOriginalBody.memoryAddress -eq 0) {
+    throw 'static method body probe requires a nonzero trusted original address'
+}
+$staticMethodWorkspace = Join-Path $OutputRoot 'static-method-body-workspace'
+Copy-Item -LiteralPath $kindProjection -Destination $staticMethodWorkspace -Recurse
+$staticMethodSource = Join-Path $staticMethodWorkspace 'src\程序集1.txt'
+$staticMethodText = [IO.File]::ReadAllText($staticMethodSource)
+$staticMethodText = [regex]::Replace($staticMethodText, '(?m)^返回 \(0\).*$', '返回 (1)')
+Write-EText $staticMethodSource $staticMethodText
+$staticMethodCandidate = Join-Path $OutputRoot 'static-method-body.e'
+$staticMethodProjection = Join-Path $OutputRoot 'static-method-body-unpacked'
+Invoke-Packager @('pack', $staticMethodWorkspace, $staticMethodCandidate)
+Invoke-Packager @('unpack', $staticMethodCandidate, $staticMethodProjection, '--main-only')
+$staticMethodOutput = Get-SnapshotByMethod $staticMethodProjection '_启动子程序'
+$staticMethodOutputBody = @($staticMethodOutput.methods | Where-Object { $_.name -eq '_启动子程序' })[0]
+if ($staticMethodOutput.classId -ne $staticMethodOriginal.classId -or
+    $staticMethodOutput.classMemoryAddress -ne $staticMethodOriginal.classMemoryAddress -or
+    $staticMethodOutputBody.id -ne $staticMethodOriginalBody.id) {
+    throw 'static method body change discarded compatible class or method identity'
+}
+if ($staticMethodOutputBody.memoryAddress -ne 0) {
+    throw "static method body change retained trusted original address: $($staticMethodOutputBody.memoryAddress)"
+}
+if ($staticMethodOutputBody.expressionData -eq $staticMethodOriginalBody.expressionData) {
+    throw 'static method body change retained the original executable payload'
+}
+
 # Adding/removing/reordering methods changes the class method table and invalidates
 # the old class block address. Existing exact method payloads remain reusable when
 # they do not reference a removed or signature-changed method identity.
@@ -2113,6 +2145,7 @@ $result = [ordered]@{
 	header_kind_roundtrip_stable = $true
 	header_kind_untrusted_snapshot_repaired = $true
 	static_class_shape_trusted_address_invalidated = $true
+	changed_method_trusted_address_invalidated = $true
 	removed_method_reference_rejected = $true
 	object_method_self_call_id = ('0x{0:X8}' -f [int]$objectMethod.id)
 	object_method_qualified_call_bound = $true
