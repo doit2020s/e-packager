@@ -4489,6 +4489,11 @@ struct NativeConstantSymbol {
 struct NativeObjectMethodEncodeContext {
 	std::unordered_map<std::string, NativeObjectVariableSymbol> variablesByName;
 	std::unordered_map<std::int32_t, std::unordered_map<std::string, NativeObjectMemberSymbol>> membersByOwnerType;
+	// Ordinary assemblies are static namespaces in E. Their type ids may still
+	// appear on a parsed variable declaration, but emitting a qualified call
+	// through such a variable produces an invalid project that E 5.9 cannot
+	// compile safely.
+	std::unordered_set<std::int32_t> nonInstantiableOwnerTypes;
 	// A form instance owns members with its form id, but uses the core Window public property table.
 	std::unordered_map<std::int32_t, std::int32_t> supportMemberTypeByOwnerType;
 	std::unordered_map<std::string, NativeConstantSymbol> constantsByName;
@@ -4502,6 +4507,84 @@ struct NativeObjectMethodEncodeContext {
 	std::int32_t implicitSupportTypeId = 0;
 	const TypeResolver* typeResolver = nullptr;
 };
+
+bool TryGetNativeTextQuoteLength(const std::string& text, size_t offset, size_t& outLength);
+
+bool TryFindNonInstantiableObjectTarget(
+	const std::string& rawCode,
+	const NativeObjectMethodEncodeContext& context,
+	std::string& outTargetName,
+	std::int32_t& outTargetTypeId)
+{
+	outTargetName.clear();
+	outTargetTypeId = 0;
+	std::string code = rawCode;
+	bool inChineseQuote = false;
+	bool inAsciiQuote = false;
+	for (size_t index = 0; index < code.size(); ++index) {
+		size_t quoteLength = 0;
+		if (!inAsciiQuote && TryGetNativeTextQuoteLength(code, index, quoteLength)) {
+			inChineseQuote = !inChineseQuote;
+			for (size_t quoteIndex = 0; quoteIndex < quoteLength; ++quoteIndex) {
+				code[index + quoteIndex] = ' ';
+			}
+			index += quoteLength - 1;
+			continue;
+		}
+		if (!inChineseQuote && code[index] == '"') {
+			inAsciiQuote = !inAsciiQuote;
+			code[index] = ' ';
+			continue;
+		}
+		if (inChineseQuote || inAsciiQuote) {
+			code[index] = ' ';
+			continue;
+		}
+		if (code[index] == '\'') {
+			code.erase(index);
+			break;
+		}
+	}
+
+	const auto isIdentifierByte = [](const unsigned char value) {
+		return value >= 0x80 || std::isalnum(value) != 0 || value == '_';
+	};
+	for (const auto& [name, variable] : context.variablesByName) {
+		if (!context.nonInstantiableOwnerTypes.contains(variable.typeId) || name.empty()) {
+			continue;
+		}
+		size_t searchOffset = 0;
+		while (searchOffset < code.size()) {
+			const size_t nameOffset = code.find(name, searchOffset);
+			if (nameOffset == std::string::npos) {
+				break;
+			}
+			searchOffset = nameOffset + name.size();
+			if (nameOffset > 0 && isIdentifierByte(static_cast<unsigned char>(code[nameOffset - 1]))) {
+				continue;
+			}
+			if (searchOffset < code.size() && isIdentifierByte(static_cast<unsigned char>(code[searchOffset]))) {
+				continue;
+			}
+			size_t dotOffset = searchOffset;
+			while (dotOffset < code.size() &&
+				std::isspace(static_cast<unsigned char>(code[dotOffset])) != 0) {
+				++dotOffset;
+			}
+			if (dotOffset >= code.size() || code[dotOffset] != '.') {
+				continue;
+			}
+			const size_t callOffset = code.find('(', dotOffset + 1);
+			if (callOffset == std::string::npos) {
+				continue;
+			}
+			outTargetName = name;
+			outTargetTypeId = variable.typeId;
+			return true;
+		}
+	}
+	return false;
+}
 
 bool HasNonCanonicalAliasedMemberOwnerBinding(
 	const std::vector<std::uint8_t>& expressionData,
@@ -5958,6 +6041,13 @@ bool TryEncodeNativeExpression(
 				}
 				return false;
 			}
+			if (context.nonInstantiableOwnerTypes.contains(targetTypeId)) {
+				if (outError != nullptr) {
+					*outError = "object_target_not_instantiable: " + memberCall.objectName +
+						" type=" + std::to_string(targetTypeId);
+				}
+				return false;
+			}
 			NativeFunctionSymbol methodSymbol;
 			if (!TryResolveNativeOwnerMethod(targetTypeId, memberCall.methodName, context, methodSymbol)) {
 				if (outError != nullptr) {
@@ -6080,6 +6170,13 @@ bool TryEncodeNativeObjectMethodCallLine(
 	if (!TryResolveNativeExpressionType(call.objectName, context, targetTypeId)) {
 		if (outError != nullptr) {
 			*outError = "object_target_type_not_found: " + call.objectName;
+		}
+		return false;
+	}
+	if (context.nonInstantiableOwnerTypes.contains(targetTypeId)) {
+		if (outError != nullptr) {
+			*outError = "object_target_not_instantiable: " + call.objectName +
+				" type=" + std::to_string(targetTypeId);
 		}
 		return false;
 	}
@@ -8549,12 +8646,20 @@ bool HasStableNativeMethodVariableLayout(
 	}
 
 	for (size_t index = 0; index < method.params.size(); ++index) {
-		if (snapshot.paramIds[index] == 0 || method.params[index].id != snapshot.paramIds[index]) {
+		const std::int32_t snapshotType =
+			index < snapshot.paramTypes.size() ? snapshot.paramTypes[index] : 0;
+		if (snapshot.paramIds[index] == 0 ||
+			method.params[index].id != snapshot.paramIds[index] ||
+			(snapshotType != 0 && method.params[index].dataType != snapshotType)) {
 			return false;
 		}
 	}
 	for (size_t index = 0; index < snapshot.localIds.size(); ++index) {
-		if (snapshot.localIds[index] == 0 || method.locals[index].id != snapshot.localIds[index]) {
+		const std::int32_t snapshotType =
+			index < snapshot.localTypes.size() ? snapshot.localTypes[index] : 0;
+		if (snapshot.localIds[index] == 0 ||
+			method.locals[index].id != snapshot.localIds[index] ||
+			(snapshotType != 0 && method.locals[index].dataType != snapshotType)) {
 			return false;
 		}
 	}
@@ -14474,6 +14579,9 @@ bool BuildRestoreModel(
 				}
 			}
 			for (const auto& item : model.classes) {
+				if (!item.isUserClass && !item.isFormClass && item.id != 0) {
+					nativeObjectEncodeContext.nonInstantiableOwnerTypes.insert(item.id);
+				}
 				for (const auto& member : item.vars) {
 					addNativeObjectMember(item.id, member.name, member.id, member.dataType);
 				}
@@ -14674,6 +14782,26 @@ bool BuildRestoreModel(
 						.methodsByOwnerType[sourceOwnerTypeId]
 						.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
 				}
+			}
+			for (const auto& bodyLine : parsedMethod.bodyLines) {
+				std::string invalidTargetName;
+				std::int32_t invalidTargetTypeId = 0;
+				if (!TryFindNonInstantiableObjectTarget(
+						bodyLine,
+						nativeObjectEncodeContext,
+						invalidTargetName,
+						invalidTargetTypeId)) {
+					continue;
+				}
+				if (outError != nullptr) {
+					*outError = LocalTextToUtf8(
+						"object_target_not_instantiable: " + invalidTargetName +
+						" type=" + std::to_string(invalidTargetTypeId) +
+						" in " + parsedClass.name + "." + parsedMethod.name +
+						" (" + parsedClass.sourcePath + ":" +
+						std::to_string(parsedMethod.bodyStartLineIndex + 1) + ")");
+				}
+				return false;
 			}
 			const bool canReuseIdentityNativeMethodSnapshot =
 				!preparedMethod.rebuildNativeCode &&

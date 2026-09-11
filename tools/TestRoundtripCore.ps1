@@ -625,6 +625,29 @@ if (-not $objectMethodHostProjection.Contains('result ＝ obj.ProbeObjectMethod 
     throw 'qualified object call did not survive the source projection'
 }
 
+# A plain assembly is a static namespace and cannot be instantiated in a local
+# variable. Reject its qualified calls during packing so an invalid project is
+# never handed to E 5.9 (which otherwise exits while compiling it).
+$staticObjectWorkspace = Join-Path $OutputRoot 'static-assembly-object-target-workspace'
+Copy-Item -LiteralPath $objectMethodUnpacked -Destination $staticObjectWorkspace -Recurse
+$staticObjectClassPath = Get-ChildItem -LiteralPath (Join-Path $staticObjectWorkspace 'src') -Filter '*.txt' -File |
+    Where-Object { [IO.File]::ReadAllText($_.FullName).Contains('.程序集 ObjectMethodProbe, <对象>, 公开') } |
+    Select-Object -First 1
+if ($null -eq $staticObjectClassPath) {
+    throw 'static-assembly object-target negative class source page is missing'
+}
+$staticObjectClassText = [IO.File]::ReadAllText($staticObjectClassPath.FullName).Replace(
+    '.程序集 ObjectMethodProbe, <对象>, 公开',
+    '.程序集 ObjectMethodProbe, , 公开')
+Write-EText $staticObjectClassPath.FullName $staticObjectClassText
+$staticObjectCandidate = Join-Path $OutputRoot 'static-assembly-object-target.e'
+$staticObjectOutput = & $Packager pack $staticObjectWorkspace $staticObjectCandidate 2>&1 | Out-String
+$staticObjectExitCode = $LASTEXITCODE
+if ($staticObjectExitCode -eq 0 -or
+    -not $staticObjectOutput.Contains('object_target_not_instantiable: obj')) {
+    throw "qualified call through a static assembly did not fail closed: exit=$staticObjectExitCode output=$staticObjectOutput"
+}
+
 $unqualifiedObjectWorkspace = Join-Path $OutputRoot 'unqualified-object-method-workspace'
 Copy-Item -LiteralPath $objectMethodUnpacked -Destination $unqualifiedObjectWorkspace -Recurse
 $unqualifiedHostPath = Get-ChildItem -LiteralPath (Join-Path $unqualifiedObjectWorkspace 'src') -Filter '*.txt' -File |
@@ -1649,7 +1672,7 @@ $sharedOwnerSourcePath = Join-Path $crossControlWorkspace "src\$sharedOwnerClass
 $sharedOwnerSourceText = @'
 .版本 2
 
-.程序集 SharedOwnerProbe, , 公开
+.程序集 SharedOwnerProbe, <对象>, 公开
 
 .子程序 ProbeSharedName, 整数型, 公开
 
@@ -2149,6 +2172,7 @@ $result = [ordered]@{
 	removed_method_reference_rejected = $true
 	object_method_self_call_id = ('0x{0:X8}' -f [int]$objectMethod.id)
 	object_method_qualified_call_bound = $true
+	static_assembly_object_target_rejected = $true
 	object_method_unqualified_external_call_rejected = $true
 	object_method_scope_change_target_id = ('0x{0:X8}' -f $assemblyObjectId)
 	object_method_scope_change_stale_local_rejected = $true
