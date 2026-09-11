@@ -57,35 +57,41 @@ inline bool TrySkipNativeBStr(
 		TrySkipNativeBytes(data, position, static_cast<size_t>(size));
 }
 
+struct NativeEvidenceInspectionContext {
+	const std::unordered_set<std::int32_t>& evidenceIds;
+	std::unordered_set<std::int32_t>* matchedIds = nullptr;
+	bool found = false;
+};
+
 inline void InspectNativeEvidenceId(
 	const std::int32_t value,
-	const std::unordered_set<std::int32_t>& unstableIds,
-	bool& outFound)
+	NativeEvidenceInspectionContext& context)
 {
-	if (unstableIds.contains(value)) {
-		outFound = true;
+	if (context.evidenceIds.contains(value)) {
+		context.found = true;
+		if (context.matchedIds != nullptr) {
+			context.matchedIds->insert(value);
+		}
 	}
 }
 
 inline bool TryInspectNativeExpressionEvidence(
 	const std::vector<std::uint8_t>& data,
 	size_t& position,
-	const std::unordered_set<std::int32_t>& unstableIds,
-	bool& outFound,
+	NativeEvidenceInspectionContext& context,
 	bool parseMember = true);
 
 inline bool TryInspectNativeParamListEvidence(
 	const std::vector<std::uint8_t>& data,
 	size_t& position,
-	const std::unordered_set<std::int32_t>& unstableIds,
-	bool& outFound)
+	NativeEvidenceInspectionContext& context)
 {
 	while (position < data.size()) {
 		if (data[position] == 0x01) {
 			++position;
 			return true;
 		}
-		if (!TryInspectNativeExpressionEvidence(data, position, unstableIds, outFound)) {
+		if (!TryInspectNativeExpressionEvidence(data, position, context)) {
 			return false;
 		}
 	}
@@ -95,8 +101,7 @@ inline bool TryInspectNativeParamListEvidence(
 inline bool TryInspectNativeCallEvidence(
 	const std::vector<std::uint8_t>& data,
 	size_t& position,
-	const std::unordered_set<std::int32_t>& unstableIds,
-	bool& outFound)
+	NativeEvidenceInspectionContext& context)
 {
 	std::int32_t methodId = 0;
 	std::int16_t libraryId = 0;
@@ -110,14 +115,14 @@ inline bool TryInspectNativeCallEvidence(
 	}
 	(void)libraryId;
 	(void)flags;
-	InspectNativeEvidenceId(methodId, unstableIds, outFound);
+	InspectNativeEvidenceId(methodId, context);
 	if (position == data.size()) {
 		return true;
 	}
 
 	const std::uint8_t marker = data[position];
 	if (marker == 0x38) {
-		if (!TryInspectNativeExpressionEvidence(data, position, unstableIds, outFound)) {
+		if (!TryInspectNativeExpressionEvidence(data, position, context)) {
 			return false;
 		}
 	}
@@ -127,14 +132,13 @@ inline bool TryInspectNativeCallEvidence(
 	else {
 		return false;
 	}
-	return TryInspectNativeParamListEvidence(data, position, unstableIds, outFound);
+	return TryInspectNativeParamListEvidence(data, position, context);
 }
 
 inline bool TryInspectNativeExpressionEvidence(
 	const std::vector<std::uint8_t>& data,
 	size_t& position,
-	const std::unordered_set<std::int32_t>& unstableIds,
-	bool& outFound,
+	NativeEvidenceInspectionContext& context,
 	const bool parseMember)
 {
 	while (position < data.size() && (data[position] == 0x1D || data[position] == 0x37)) {
@@ -161,14 +165,14 @@ inline bool TryInspectNativeExpressionEvidence(
 		if (!TryReadNativeI32(data, position, id)) {
 			return false;
 		}
-		InspectNativeEvidenceId(id, unstableIds, outFound);
+		InspectNativeEvidenceId(id, context);
 		break;
 	}
 	case 0x1C:
 		return TrySkipNativeBytes(data, position, sizeof(std::int16_t) * 2);
 	case 0x1F:
 		while (position < data.size() && data[position] != 0x20) {
-			if (!TryInspectNativeExpressionEvidence(data, position, unstableIds, outFound)) {
+			if (!TryInspectNativeExpressionEvidence(data, position, context)) {
 				return false;
 			}
 		}
@@ -178,7 +182,7 @@ inline bool TryInspectNativeExpressionEvidence(
 		++position;
 		break;
 	case 0x21:
-		if (!TryInspectNativeCallEvidence(data, position, unstableIds, outFound)) {
+		if (!TryInspectNativeCallEvidence(data, position, context)) {
 			return false;
 		}
 		break;
@@ -192,12 +196,12 @@ inline bool TryInspectNativeExpressionEvidence(
 		if (!TryReadNativeI32(data, position, variableId)) {
 			return false;
 		}
-		InspectNativeEvidenceId(variableId, unstableIds, outFound);
+		InspectNativeEvidenceId(variableId, context);
 		if (variableId == 0x0500FFFE) {
 			if (position >= data.size() || data[position++] != 0x3A) {
 				return false;
 			}
-			return TryInspectNativeExpressionEvidence(data, position, unstableIds, outFound);
+			return TryInspectNativeExpressionEvidence(data, position, context);
 		}
 		break;
 	}
@@ -209,7 +213,7 @@ inline bool TryInspectNativeExpressionEvidence(
 	case 0x6E:
 	case 0x70:
 	case 0x71:
-		return TryInspectNativeCallEvidence(data, position, unstableIds, outFound);
+		return TryInspectNativeCallEvidence(data, position, context);
 	default:
 		return false;
 	}
@@ -227,13 +231,13 @@ inline bool TryInspectNativeExpressionEvidence(
 				!TryReadNativeI32(data, position, ownerTypeId)) {
 				return false;
 			}
-			InspectNativeEvidenceId(memberId, unstableIds, outFound);
-			InspectNativeEvidenceId(ownerTypeId, unstableIds, outFound);
+			InspectNativeEvidenceId(memberId, context);
+			InspectNativeEvidenceId(ownerTypeId, context);
 			continue;
 		}
 		if (data[position] == 0x3A) {
 			++position;
-			if (!TryInspectNativeExpressionEvidence(data, position, unstableIds, outFound, false)) {
+			if (!TryInspectNativeExpressionEvidence(data, position, context, false)) {
 				return false;
 			}
 			continue;
@@ -250,14 +254,13 @@ inline bool TryInspectNativeExpressionEvidence(
 inline bool TryInspectNativeReferenceSlot(
 	const std::vector<std::uint8_t>& expressionData,
 	const std::int32_t reference,
-	const std::unordered_set<std::int32_t>& unstableIds,
-	bool& outFound)
+	NativeEvidenceInspectionContext& context)
 {
 	if (reference < 0 || static_cast<size_t>(reference) >= expressionData.size()) {
 		return false;
 	}
 	size_t position = static_cast<size_t>(reference);
-	return TryInspectNativeExpressionEvidence(expressionData, position, unstableIds, outFound);
+	return TryInspectNativeExpressionEvidence(expressionData, position, context);
 }
 
 }  // namespace native_reference_policy_detail
@@ -266,6 +269,41 @@ inline bool TryInspectNativeReferenceSlot(
 // relocatable method, variable/member, or constant IDs. Parse from those slots
 // so an identical four-byte sequence inside text or numeric payload cannot
 // invalidate an otherwise reusable native line.
+inline bool TryCollectNativeExpressionReferenceSlotEvidenceIds(
+	const std::vector<std::uint8_t>& expressionData,
+	const std::vector<std::int32_t>& methodReferences,
+	const std::vector<std::int32_t>& variableReferences,
+	const std::vector<std::int32_t>& constantReferences,
+	const std::unordered_set<std::int32_t>& evidenceIds,
+	std::unordered_set<std::int32_t>& outMatchedIds)
+{
+	outMatchedIds.clear();
+	if (expressionData.empty() || evidenceIds.empty()) {
+		return true;
+	}
+
+	native_reference_policy_detail::NativeEvidenceInspectionContext context{
+		evidenceIds,
+		&outMatchedIds,
+	};
+	std::unordered_set<std::int32_t> inspectedReferences;
+	for (const auto* references : { &methodReferences, &variableReferences, &constantReferences }) {
+		for (const std::int32_t reference : *references) {
+			if (!inspectedReferences.insert(reference).second) {
+				continue;
+			}
+			if (!native_reference_policy_detail::TryInspectNativeReferenceSlot(
+					expressionData,
+					reference,
+					context)) {
+				outMatchedIds.clear();
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
 inline bool NativeExpressionReferenceSlotsContainAnyEvidenceId(
 	const std::vector<std::uint8_t>& expressionData,
 	const std::vector<std::int32_t>& methodReferences,
@@ -273,32 +311,19 @@ inline bool NativeExpressionReferenceSlotsContainAnyEvidenceId(
 	const std::vector<std::int32_t>& constantReferences,
 	const std::unordered_set<std::int32_t>& unstableIds)
 {
-	if (expressionData.empty() || unstableIds.empty()) {
-		return false;
+	std::unordered_set<std::int32_t> matchedIds;
+	if (!TryCollectNativeExpressionReferenceSlotEvidenceIds(
+			expressionData,
+			methodReferences,
+			variableReferences,
+			constantReferences,
+			unstableIds,
+			matchedIds)) {
+		// A malformed proven reference cannot be safely copied when an ID
+		// migration is active, even though no byte-window guess is made.
+		return true;
 	}
-
-	std::unordered_set<std::int32_t> inspectedReferences;
-	for (const auto* references : { &methodReferences, &variableReferences, &constantReferences }) {
-		for (const std::int32_t reference : *references) {
-			if (!inspectedReferences.insert(reference).second) {
-				continue;
-			}
-			bool found = false;
-			if (!native_reference_policy_detail::TryInspectNativeReferenceSlot(
-					expressionData,
-					reference,
-					unstableIds,
-					found)) {
-				// A malformed proven reference cannot be safely copied when an ID
-				// migration is active, even though no byte-window guess is made.
-				return true;
-			}
-			if (found) {
-				return true;
-			}
-		}
-	}
-	return false;
+	return !matchedIds.empty();
 }
 
 }  // namespace e2txt

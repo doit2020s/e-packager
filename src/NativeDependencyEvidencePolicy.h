@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -158,46 +159,237 @@ inline bool CanImportLoadedDependencyBundle(
 	return !hasTrustedNativeRecord || canonicalSourceBindingValid;
 }
 
+// Compare a type in a declaration loaded from an EC with the corresponding
+// type preserved in the host project's native dependency table. Imported ECs
+// have their own ID space, so an internal user type can legitimately have a
+// different ID in the dependency and the host. Such an opaque host ID is
+// accepted only when the canonical dependency snapshot names the type at the
+// same declaration slot. A host-side name, when present, is authoritative and
+// a conflict must not fall through to the dependency-local evidence.
+inline bool DoesCanonicalDependencyImportedTypeMatch(
+	const std::string& parsedTypeName,
+	const std::int32_t parsedResolvedType,
+	const std::int32_t hostNativeType,
+	const bool hostNativeTypeNameAmbiguous,
+	const std::optional<std::string>& hostNativeTypeName,
+	const std::int32_t canonicalNativeType,
+	const std::optional<std::string>& canonicalNativeTypeName)
+{
+	if (parsedTypeName.empty()) {
+		return hostNativeType == 0;
+	}
+	if (hostNativeTypeNameAmbiguous) {
+		return false;
+	}
+	if (hostNativeTypeName.has_value()) {
+		return *hostNativeTypeName == parsedTypeName;
+	}
+	if (parsedResolvedType != 0 && parsedResolvedType == hostNativeType) {
+		return true;
+	}
+	if (canonicalNativeType == 0 || !canonicalNativeTypeName.has_value() ||
+		*canonicalNativeTypeName != parsedTypeName) {
+		return false;
+	}
+
+	constexpr std::int32_t kTypeMask = static_cast<std::int32_t>(0xFF000000u);
+	constexpr std::int32_t kStaticClassType = 0x09000000;
+	constexpr std::int32_t kFormClassType = 0x19000000;
+	constexpr std::int32_t kStructType = 0x41000000;
+	constexpr std::int32_t kClassType = 0x49000000;
+	const auto normalizeUserType = [&](const std::int32_t value) {
+		const std::int32_t type = value & kTypeMask;
+		if (type == kStaticClassType || type == kFormClassType || type == kClassType) {
+			return kClassType;
+		}
+		return type == kStructType ? kStructType : 0;
+	};
+	const std::int32_t hostCategory = normalizeUserType(hostNativeType);
+	return hostCategory != 0 && hostCategory == normalizeUserType(canonicalNativeType);
+}
+
 struct NativeDependencyRangeEvidence {
 	std::int32_t start = 0;
 	std::int32_t count = 0;
 	size_t recordIndex = 0;
 };
 
+struct NativeDependencyOwnerCandidateEvidence {
+	size_t recordIndex = 0;
+	bool exactStart = false;
+	bool reExport = false;
+};
+
+inline std::int32_t SelectNativeDependencyClassType(
+	const std::int32_t parsedClassType,
+	const std::int32_t trustedNativeClassId)
+{
+	constexpr std::int32_t kTypeMask = static_cast<std::int32_t>(0xFF000000u);
+	constexpr std::int32_t kStaticClassType = 0x09000000;
+	constexpr std::int32_t kFormClassType = 0x19000000;
+	constexpr std::int32_t kClassType = 0x49000000;
+	const std::int32_t nativeType = trustedNativeClassId & kTypeMask;
+	if (nativeType == kClassType || nativeType == kStaticClassType || nativeType == kFormClassType) {
+		return nativeType;
+	}
+	return parsedClassType;
+}
+
+// Overlapping ordered slices can be created by re-exported dependencies. A
+// sole candidate owns the symbol. With overlap, an exact range start is the
+// strongest evidence; otherwise exactly one direct (non-re-export) record must
+// remain or ownership is ambiguous.
+inline std::optional<size_t> SelectNativeDependencyOwner(
+	const std::vector<NativeDependencyOwnerCandidateEvidence>& rawCandidates)
+{
+	std::unordered_map<size_t, NativeDependencyOwnerCandidateEvidence> candidatesByRecord;
+	for (const auto& candidate : rawCandidates) {
+		auto [it, inserted] = candidatesByRecord.emplace(candidate.recordIndex, candidate);
+		if (!inserted) {
+			it->second.exactStart = it->second.exactStart || candidate.exactStart;
+			it->second.reExport = it->second.reExport && candidate.reExport;
+		}
+	}
+	if (candidatesByRecord.size() == 1) {
+		return candidatesByRecord.begin()->first;
+	}
+	std::optional<size_t> exactOwner;
+	for (const auto& [recordIndex, candidate] : candidatesByRecord) {
+		if (!candidate.exactStart) {
+			continue;
+		}
+		if (exactOwner.has_value()) {
+			return std::nullopt;
+		}
+		exactOwner = recordIndex;
+	}
+	if (exactOwner.has_value()) {
+		return exactOwner;
+	}
+	std::optional<size_t> directOwner;
+	for (const auto& [recordIndex, candidate] : candidatesByRecord) {
+		if (candidate.reExport) {
+			continue;
+		}
+		if (directOwner.has_value()) {
+			return std::nullopt;
+		}
+		directOwner = recordIndex;
+	}
+	return directOwner;
+}
+
+inline bool TryBuildNativeDependencyEmissionOrder(
+	const std::vector<std::int32_t>& itemIds,
+	const std::unordered_map<std::int32_t, size_t>& owners,
+	const std::vector<std::vector<std::int32_t>>& orderedRangeIdsByOwner,
+	std::vector<std::int32_t>& outIds)
+{
+	outIds.clear();
+	std::unordered_set<std::int32_t> uniqueItemIds;
+	for (const std::int32_t id : itemIds) {
+		if (id == 0 || !uniqueItemIds.insert(id).second) {
+			return false;
+		}
+	}
+	std::unordered_set<std::int32_t> emitted;
+	const auto append = [&](const std::int32_t id) {
+		if (!uniqueItemIds.contains(id) || !emitted.insert(id).second) {
+			return false;
+		}
+		outIds.push_back(id);
+		return true;
+	};
+	for (const std::int32_t id : itemIds) {
+		if (!owners.contains(id) && !append(id)) {
+			return false;
+		}
+	}
+	for (size_t ownerIndex = 0; ownerIndex < orderedRangeIdsByOwner.size(); ++ownerIndex) {
+		for (const std::int32_t id : orderedRangeIdsByOwner[ownerIndex]) {
+			const auto owner = owners.find(id);
+			if (owner == owners.end() || owner->second != ownerIndex || emitted.contains(id)) {
+				continue;
+			}
+			if (!append(id)) {
+				return false;
+			}
+		}
+	}
+	return emitted.size() == itemIds.size();
+}
+
 template <typename NormalizeType>
 bool ValidateNativeDependencyRanges(
 	const std::vector<NativeDependencyRangeEvidence>& ranges,
 	NormalizeType&& normalizeType)
 {
-	struct Span {
+	struct RangeKey {
 		std::int32_t type = 0;
 		std::int32_t start = 0;
-		std::int32_t end = 0;
 		size_t recordIndex = 0;
 	};
-	std::vector<Span> spans;
-	spans.reserve(ranges.size());
+	std::vector<RangeKey> keys;
+	keys.reserve(ranges.size());
 	for (const auto& range : ranges) {
 		if (range.count <= 0) {
 			return false;
 		}
 		const std::int32_t type = normalizeType(range.start);
 		const std::int32_t start = range.start & 0x00FFFFFF;
-		const std::int64_t end64 = static_cast<std::int64_t>(start) + range.count - 1;
-		if (type == 0 || end64 > 0x00FFFFFF) {
+		if (type == 0 || start == 0) {
 			return false;
 		}
-		spans.push_back(Span{ type, start, static_cast<std::int32_t>(end64), range.recordIndex });
+		keys.push_back(RangeKey{ type, start, range.recordIndex });
 	}
-	std::sort(spans.begin(), spans.end(), [](const Span& left, const Span& right) {
-		return std::tie(left.type, left.start, left.end, left.recordIndex) <
-			std::tie(right.type, right.start, right.end, right.recordIndex);
+	std::sort(keys.begin(), keys.end(), [](const RangeKey& left, const RangeKey& right) {
+		return std::tie(left.type, left.start, left.recordIndex) <
+			std::tie(right.type, right.start, right.recordIndex);
 	});
-	for (size_t index = 1; index < spans.size(); ++index) {
-		if (spans[index - 1].type == spans[index].type &&
-			spans[index].start <= spans[index - 1].end) {
+	for (size_t index = 1; index < keys.size(); ++index) {
+		if (keys[index - 1].type == keys[index].type &&
+			keys[index - 1].start == keys[index].start) {
 			return false;
 		}
+	}
+	return true;
+}
+
+// EC defined-id start/count pairs address a contiguous slice of the matching
+// native program table. Native IDs inside that slice may be sparse or decrease;
+// count is never a numeric interval width.
+template <typename NormalizeType>
+bool TryCollectNativeDependencyOrderedRange(
+	const std::int32_t startId,
+	const std::int32_t count,
+	const std::vector<std::int32_t>& orderedIds,
+	NormalizeType&& normalizeType,
+	std::vector<std::int32_t>& outIds)
+{
+	outIds.clear();
+	if (count <= 0 || normalizeType(startId) == 0) {
+		return false;
+	}
+	std::vector<std::int32_t> matchingIds;
+	matchingIds.reserve(orderedIds.size());
+	const std::int32_t rangeType = normalizeType(startId);
+	for (const std::int32_t id : orderedIds) {
+		if (normalizeType(id) == rangeType) {
+			matchingIds.push_back(id);
+		}
+	}
+	const auto startIt = std::find(matchingIds.begin(), matchingIds.end(), startId);
+	if (startIt == matchingIds.end()) {
+		return false;
+	}
+	const size_t startIndex = static_cast<size_t>(std::distance(matchingIds.begin(), startIt));
+	const size_t itemCount = static_cast<size_t>(count);
+	if (matchingIds.empty() || itemCount > matchingIds.size()) {
+		return false;
+	}
+	outIds.reserve(itemCount);
+	for (size_t offset = 0; offset < itemCount; ++offset) {
+		outIds.push_back(matchingIds[(startIndex + offset) % matchingIds.size()]);
 	}
 	return true;
 }
@@ -236,15 +428,48 @@ inline bool IsUniquePublicDeclarationForDependency(
 }
 
 template <typename Observe>
-void ObserveNonZeroNativeEvidenceIds(
-	const std::vector<std::int32_t>& ids,
+void ObserveClaimedNativeEvidenceIds(
+	const std::unordered_set<std::int32_t>& claimedIds,
 	Observe&& observe)
 {
-	for (const std::int32_t id : ids) {
+	for (const std::int32_t id : claimedIds) {
 		if (id != 0) {
 			observe(id);
 		}
 	}
+}
+
+// The program header is the persistent high-water mark, including identities
+// removed from the live tables. Seed an allocator from it before allocating a
+// new symbol so a deleted identity cannot be reused.
+template <typename Observe>
+void ObserveNativeProgramHeaderHighWater(
+	const std::int32_t versionFlag1,
+	Observe&& observe)
+{
+	if (versionFlag1 > 0) {
+		observe(versionFlag1);
+	}
+}
+
+inline std::int32_t SelectNativeProgramHeaderHighWater(
+	const std::int32_t allocatedIdNum,
+	const std::optional<std::int32_t> preservedVersionFlag1)
+{
+	return preservedVersionFlag1.has_value()
+		? (std::max)(allocatedIdNum, *preservedVersionFlag1)
+		: allocatedIdNum;
+}
+
+inline std::unordered_set<std::int32_t> CollectUnemittedNativeEvidenceIds(
+	const std::unordered_set<std::int32_t>& candidateIds,
+	const std::unordered_set<std::int32_t>& emittedDefinitionIds)
+{
+	std::unordered_set<std::int32_t> result = candidateIds;
+	for (const std::int32_t id : emittedDefinitionIds) {
+		result.erase(id);
+	}
+	return result;
 }
 
 inline bool AreNativeEvidenceIdsAvailable(

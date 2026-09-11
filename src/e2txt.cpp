@@ -4285,22 +4285,189 @@ std::int32_t GetUserIdNum(const std::int32_t id)
 	return id & epl_system_id::kMaskNum;
 }
 
-bool IsDependencyDefinedId(const std::vector<EComDependencyRecord>& records, const std::int32_t id)
+std::int32_t NormalizeDependencyDefinedIdType(const std::int32_t id)
 {
-	if ((id & epl_system_id::kMaskType) == 0) {
+	const std::int32_t type = epl_system_id::GetType(id);
+	if (type == epl_system_id::kTypeClass ||
+		type == epl_system_id::kTypeStaticClass ||
+		type == epl_system_id::kTypeFormClass) {
+		return epl_system_id::kTypeClass;
+	}
+	if (type == epl_system_id::kTypeConstant ||
+		type == epl_system_id::kTypeImageResource ||
+		type == epl_system_id::kTypeSoundResource) {
+		// The native dependency record has one resource slot. Its ordered table
+		// contains value constants, images and sounds together.
+		return epl_system_id::kTypeConstant;
+	}
+	return type;
+}
+
+bool TryCollectDependencyDefinedIdRange(
+	const ModuleSections& sections,
+	const std::int32_t startId,
+	const std::int32_t count,
+	std::vector<std::int32_t>& outIds,
+	std::string* outReason = nullptr)
+{
+	outIds.clear();
+	if (outReason != nullptr) {
+		outReason->clear();
+	}
+	if (count <= 0 || (startId & epl_system_id::kMaskType) == 0) {
 		return false;
 	}
 
-	const std::int32_t idNum = GetUserIdNum(id);
-	for (const auto& record : records) {
-		for (const auto& range : record.definedIds) {
-			const std::int32_t startNum = GetUserIdNum(range.start);
-			if (range.count > 0 && idNum >= startNum && idNum < startNum + range.count) {
-				return true;
+	const std::int32_t normalizedType = NormalizeDependencyDefinedIdType(startId);
+	std::vector<std::int32_t> orderedIds;
+	const auto appendMatching = [&](const std::int32_t id) {
+		if (NormalizeDependencyDefinedIdType(id) == normalizedType) {
+			orderedIds.push_back(id);
+		}
+	};
+	if (normalizedType == epl_system_id::kTypeClass) {
+		orderedIds.reserve(sections.program.codePages.size());
+		for (const auto& item : sections.program.codePages) {
+			appendMatching(item.header.dwId);
+		}
+	}
+	else if (normalizedType == epl_system_id::kTypeMethod) {
+		orderedIds.reserve(sections.program.functions.size());
+		for (const auto& item : sections.program.functions) {
+			appendMatching(item.header.dwId);
+		}
+	}
+	else if (normalizedType == epl_system_id::kTypeGlobal) {
+		orderedIds.reserve(sections.program.globals.size());
+		for (const auto& item : sections.program.globals) {
+			appendMatching(item.marker);
+		}
+	}
+	else if (normalizedType == epl_system_id::kTypeStruct) {
+		orderedIds.reserve(sections.program.dataTypes.size());
+		for (const auto& item : sections.program.dataTypes) {
+			appendMatching(item.header.dwId);
+		}
+	}
+	else if (normalizedType == epl_system_id::kTypeDll) {
+		orderedIds.reserve(sections.program.dlls.size());
+		for (const auto& item : sections.program.dlls) {
+			appendMatching(item.header.dwId);
+		}
+	}
+	else if (normalizedType == epl_system_id::kTypeConstant ||
+		normalizedType == epl_system_id::kTypeImageResource ||
+		normalizedType == epl_system_id::kTypeSoundResource) {
+		orderedIds.reserve(sections.resources.constants.size());
+		for (const auto& item : sections.resources.constants) {
+			appendMatching(item.marker);
+		}
+	}
+	else {
+		return false;
+	}
+
+	const auto startIt = std::find(orderedIds.begin(), orderedIds.end(), startId);
+	if (startIt == orderedIds.end()) {
+		if (outReason != nullptr) {
+			*outReason = "start_not_found table_size=" + std::to_string(orderedIds.size());
+		}
+		return false;
+	}
+	const size_t startIndex = static_cast<size_t>(std::distance(orderedIds.begin(), startIt));
+	const size_t itemCount = static_cast<size_t>(count);
+	if (orderedIds.empty() || itemCount > orderedIds.size()) {
+		if (outReason != nullptr) {
+			*outReason = "count_exceeds_table_size start_index=" + std::to_string(startIndex) +
+				" table_size=" + std::to_string(orderedIds.size());
+		}
+		return false;
+	}
+	outIds.reserve(itemCount);
+	for (size_t offset = 0; offset < itemCount; ++offset) {
+		outIds.push_back(orderedIds[(startIndex + offset) % orderedIds.size()]);
+	}
+	return true;
+}
+
+bool TryBuildDependencyDefinedIdOwners(
+	const ModuleSections& sections,
+	const std::vector<EComDependencyRecord>& records,
+	std::unordered_map<std::int32_t, size_t>& outOwners,
+	std::string* outReason = nullptr)
+{
+	outOwners.clear();
+	if (outReason != nullptr) {
+		outReason->clear();
+	}
+	std::vector<NativeDependencyRangeEvidence> rangeEvidence;
+	std::unordered_map<std::int32_t, std::vector<NativeDependencyOwnerCandidateEvidence>> candidatesById;
+	for (size_t recordIndex = 0; recordIndex < records.size(); ++recordIndex) {
+		for (const auto& range : records[recordIndex].definedIds) {
+			rangeEvidence.push_back(NativeDependencyRangeEvidence{
+				range.start,
+				range.count,
+				recordIndex,
+			});
+		}
+	}
+	if (!ValidateNativeDependencyRanges(
+			rangeEvidence,
+			NormalizeDependencyDefinedIdType)) {
+		if (outReason != nullptr) {
+			*outReason = "invalid_or_duplicate_ordered_range_start";
+		}
+		return false;
+	}
+	for (size_t recordIndex = 0; recordIndex < records.size(); ++recordIndex) {
+		for (const auto& range : records[recordIndex].definedIds) {
+			std::vector<std::int32_t> ids;
+			std::string rangeReason;
+			if (!TryCollectDependencyDefinedIdRange(
+					sections,
+					range.start,
+					range.count,
+					ids,
+					&rangeReason)) {
+				if (outReason != nullptr) {
+					*outReason = "ordered_range_invalid record=" + std::to_string(recordIndex) +
+						" start=" + std::to_string(range.start) +
+						" count=" + std::to_string(range.count) +
+						" reason=" + rangeReason;
+				}
+				outOwners.clear();
+				return false;
+			}
+			for (const std::int32_t id : ids) {
+				auto& candidates = candidatesById[id];
+				const bool exactStart = id == range.start;
+				candidates.push_back(NativeDependencyOwnerCandidateEvidence{
+					recordIndex,
+					exactStart,
+					records[recordIndex].reExport,
+				});
 			}
 		}
 	}
-	return false;
+	for (const auto& [id, candidates] : candidatesById) {
+		const auto owner = SelectNativeDependencyOwner(candidates);
+		if (!owner.has_value()) {
+			if (outReason != nullptr) {
+				*outReason = "ambiguous_dependency_owner id=" + std::to_string(id);
+			}
+			outOwners.clear();
+			return false;
+		}
+		outOwners.insert_or_assign(id, *owner);
+	}
+	return true;
+}
+
+bool IsDependencyDefinedId(
+	const std::unordered_map<std::int32_t, size_t>& owners,
+	const std::int32_t id)
+{
+	return owners.contains(id);
 }
 
 bool IsClassHidden(const ModuleSections& sections, const std::int32_t classId)
@@ -4379,7 +4546,7 @@ std::string ResolveProgramPageLogicalName(
 
 bool ShouldKeepPage(
 	const ModuleSections& sections,
-	const std::vector<EComDependencyRecord>& dependencyRecords,
+	const std::unordered_map<std::int32_t, size_t>& dependencyDefinedIdOwners,
 	const CodePageInfo& page,
 	const std::vector<const FunctionInfo*>& functions,
 	bool includeImportedPages)
@@ -4387,7 +4554,7 @@ bool ShouldKeepPage(
 	if (page.name == "__HIDDEN_TEMP_MOD__") {
 		return false;
 	}
-	if (IsClassHidden(sections, page.header.dwId) || IsDependencyDefinedId(dependencyRecords, page.header.dwId)) {
+	if (IsClassHidden(sections, page.header.dwId) || IsDependencyDefinedId(dependencyDefinedIdOwners, page.header.dwId)) {
 		return false;
 	}
 	if (IsAnonymousProgramPage(page)) {
@@ -5717,6 +5884,7 @@ void BuildProgramPages(
 	const ModuleSections& sections,
 	const AnonymousTypeHints& hints,
 	const GenerateOptions& options,
+	const std::unordered_map<std::int32_t, size_t>& dependencyDefinedIdOwners,
 	Document& outDocument)
 {
 	SymbolResolver resolver(
@@ -5724,12 +5892,10 @@ void BuildProgramPages(
 		sections.resources,
 		outDocument.sourcePath,
 		&sections.losable.removedDefinedItems);
-	std::vector<EComDependencyRecord> dependencyRecords;
-	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
 	TraceLine("BuildProgramPages begin");
 	for (const auto& pageInfo : sections.program.codePages) {
 		const auto functions = CollectPageFunctions(sections.program, pageInfo);
-		if (!ShouldKeepPage(sections, dependencyRecords, pageInfo, functions, options.includeImportedPages)) {
+		if (!ShouldKeepPage(sections, dependencyDefinedIdOwners, pageInfo, functions, options.includeImportedPages)) {
 			continue;
 		}
 		const std::string logicalPageName = ResolveProgramPageLogicalName(sections.program, pageInfo, resolver);
@@ -5834,14 +6000,13 @@ void BuildProgramPages(
 void BuildGlobalPage(
 	const ModuleSections& sections,
 	const AnonymousTypeHints& hints,
+	const std::unordered_map<std::int32_t, size_t>& dependencyDefinedIdOwners,
 	Document& outDocument)
 {
 	if (sections.program.globals.empty()) {
 		return;
 	}
 
-	std::vector<EComDependencyRecord> dependencyRecords;
-	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
 	SymbolResolver resolver(
 		sections.program,
 		sections.resources,
@@ -5853,7 +6018,7 @@ void BuildGlobalPage(
 	AppendLine(page, ".版本 2");
 	AppendLine(page, "");
 	for (const auto& item : sections.program.globals) {
-		if (IsGlobalHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker)) {
+		if (IsGlobalHidden(item) || IsDependencyDefinedId(dependencyDefinedIdOwners, item.marker)) {
 			continue;
 		}
 		AppendLine(page, BuildGlobalVariableLine(item, resolver, &hints));
@@ -5863,14 +6028,16 @@ void BuildGlobalPage(
 	}
 }
 
-void BuildStructPage(const ModuleSections& sections, const AnonymousTypeHints& hints, Document& outDocument)
+void BuildStructPage(
+	const ModuleSections& sections,
+	const AnonymousTypeHints& hints,
+	const std::unordered_map<std::int32_t, size_t>& dependencyDefinedIdOwners,
+	Document& outDocument)
 {
 	if (sections.program.dataTypes.empty()) {
 		return;
 	}
 
-	std::vector<EComDependencyRecord> dependencyRecords;
-	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
 	SymbolResolver resolver(
 		sections.program,
 		sections.resources,
@@ -5884,7 +6051,7 @@ void BuildStructPage(const ModuleSections& sections, const AnonymousTypeHints& h
 	for (const auto& item : sections.program.dataTypes) {
 		if (IsTxt2EPlaceholderStruct(item) ||
 			IsStructHidden(item) ||
-			IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
+			IsDependencyDefinedId(dependencyDefinedIdOwners, item.header.dwId)) {
 			continue;
 		}
 		std::string typeName = TrimAsciiCopy(item.name);
@@ -5914,14 +6081,16 @@ void BuildStructPage(const ModuleSections& sections, const AnonymousTypeHints& h
 	}
 }
 
-void BuildDllPage(const ModuleSections& sections, const AnonymousTypeHints& hints, Document& outDocument)
+void BuildDllPage(
+	const ModuleSections& sections,
+	const AnonymousTypeHints& hints,
+	const std::unordered_map<std::int32_t, size_t>& dependencyDefinedIdOwners,
+	Document& outDocument)
 {
 	if (sections.program.dlls.empty()) {
 		return;
 	}
 
-	std::vector<EComDependencyRecord> dependencyRecords;
-	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
 	SymbolResolver resolver(
 		sections.program,
 		sections.resources,
@@ -5933,7 +6102,7 @@ void BuildDllPage(const ModuleSections& sections, const AnonymousTypeHints& hint
 	AppendLine(page, ".版本 2");
 	AppendLine(page, "");
 	for (const auto& item : sections.program.dlls) {
-		if (IsDllHidden(item) || IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
+		if (IsDllHidden(item) || IsDependencyDefinedId(dependencyDefinedIdOwners, item.header.dwId)) {
 			continue;
 		}
 		const std::string dllName = TrimAsciiCopy(resolver.ResolveUserName(item.header.dwId));
@@ -5958,17 +6127,18 @@ void BuildDllPage(const ModuleSections& sections, const AnonymousTypeHints& hint
 	}
 }
 
-void BuildConstantPage(const ModuleSections& sections, Document& outDocument)
+void BuildConstantPage(
+	const ModuleSections& sections,
+	const std::unordered_map<std::int32_t, size_t>& dependencyDefinedIdOwners,
+	Document& outDocument)
 {
-	std::vector<EComDependencyRecord> dependencyRecords;
-	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
 	const bool hasValueConstants = std::any_of(
 		sections.resources.constants.begin(),
 		sections.resources.constants.end(),
 		[&](const ConstantInfo& item) {
 			return item.pageType == kConstPageValue &&
 				!IsConstantHidden(item) &&
-				!IsDependencyDefinedId(dependencyRecords, item.marker);
+				!IsDependencyDefinedId(dependencyDefinedIdOwners, item.marker);
 		});
 	if (!hasValueConstants) {
 		return;
@@ -5989,7 +6159,7 @@ void BuildConstantPage(const ModuleSections& sections, Document& outDocument)
 			item.valueText == "<图片>" ||
 			item.valueText == "<声音>" ||
 			IsConstantHidden(item) ||
-			IsDependencyDefinedId(dependencyRecords, item.marker)) {
+			IsDependencyDefinedId(dependencyDefinedIdOwners, item.marker)) {
 			continue;
 		}
 		std::string valueText = item.valueText;
@@ -6486,14 +6656,29 @@ bool BuildDocumentFromSections(
 	document.versionText = BuildVersionText(sections);
 
 	BuildDependencies(sections, document);
+	std::vector<EComDependencyRecord> dependencyRecords;
+	if (!ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords) ||
+		std::any_of(
+			dependencyRecords.begin(),
+			dependencyRecords.end(),
+			[](const EComDependencyRecord& record) { return record.hasInvalidDefinedIdRange; })) {
+		return false;
+	}
+	std::unordered_map<std::int32_t, size_t> dependencyDefinedIdOwners;
+	if (!TryBuildDependencyDefinedIdOwners(
+			sections,
+			dependencyRecords,
+			dependencyDefinedIdOwners)) {
+		return false;
+	}
 	const AnonymousTypeHints anonymousTypeHints = BuildAnonymousTypeHints(sections, sourcePath);
-	BuildProgramPages(sections, anonymousTypeHints, options, document);
-	BuildGlobalPage(sections, anonymousTypeHints, document);
-	BuildStructPage(sections, anonymousTypeHints, document);
-	BuildDllPage(sections, anonymousTypeHints, document);
+	BuildProgramPages(sections, anonymousTypeHints, options, dependencyDefinedIdOwners, document);
+	BuildGlobalPage(sections, anonymousTypeHints, dependencyDefinedIdOwners, document);
+	BuildStructPage(sections, anonymousTypeHints, dependencyDefinedIdOwners, document);
+	BuildDllPage(sections, anonymousTypeHints, dependencyDefinedIdOwners, document);
 	BuildFormPage(sections, document);
 	BuildFormXmlEntries(sections, document);
-	BuildConstantPage(sections, document);
+	BuildConstantPage(sections, dependencyDefinedIdOwners, document);
 	outDocument = std::move(document);
 	return true;
 }
@@ -6550,6 +6735,13 @@ std::string BuildPublicHeaderText(
 		sections.resources,
 		sourcePath,
 		&sections.losable.removedDefinedItems);
+	std::unordered_map<std::int32_t, size_t> dependencyDefinedIdOwners;
+	if (!TryBuildDependencyDefinedIdOwners(
+			sections,
+			dependencyRecords,
+			dependencyDefinedIdOwners)) {
+		return std::string();
+	}
 	std::vector<std::string> lines;
 	lines.push_back("模块名称：" + projectName);
 	lines.push_back("作者：" + author);
@@ -6586,7 +6778,7 @@ std::string BuildPublicHeaderText(
 	const auto appendProgramPages = [&](const bool classPagesOnly) {
 		for (const auto& pageInfo : sections.program.codePages) {
 			const auto functions = CollectPageFunctions(sections.program, pageInfo);
-			if (!ShouldKeepPage(sections, dependencyRecords, pageInfo, functions, true)) {
+			if (!ShouldKeepPage(sections, dependencyDefinedIdOwners, pageInfo, functions, true)) {
 				continue;
 			}
 
@@ -6632,7 +6824,7 @@ std::string BuildPublicHeaderText(
 	appendProgramPages(false);
 
 	for (const auto& item : sections.program.globals) {
-		if ((item.attr & 0x0100) == 0 || IsGlobalHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker)) {
+		if ((item.attr & 0x0100) == 0 || IsGlobalHidden(item) || IsDependencyDefinedId(dependencyDefinedIdOwners, item.marker)) {
 			continue;
 		}
 		appendBlankLine();
@@ -6644,7 +6836,7 @@ std::string BuildPublicHeaderText(
 		if (IsTxt2EPlaceholderStruct(item) ||
 			!IsStructPublic(item) ||
 			IsStructHidden(item) ||
-			IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
+			IsDependencyDefinedId(dependencyDefinedIdOwners, item.header.dwId)) {
 			continue;
 		}
 		appendBlankLine();
@@ -6676,7 +6868,7 @@ std::string BuildPublicHeaderText(
 	appendProgramPages(true);
 
 	for (const auto& item : sections.program.dlls) {
-		if ((item.attr & 0x2) == 0 || IsDllHidden(item) || IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
+		if ((item.attr & 0x2) == 0 || IsDllHidden(item) || IsDependencyDefinedId(dependencyDefinedIdOwners, item.header.dwId)) {
 			continue;
 		}
 		appendBlankLine();
@@ -6706,7 +6898,7 @@ std::string BuildPublicHeaderText(
 			item.valueText == "<声音>" ||
 			(item.attr & 0x2) == 0 ||
 			IsConstantHidden(item) ||
-			IsDependencyDefinedId(dependencyRecords, item.marker)) {
+			IsDependencyDefinedId(dependencyDefinedIdOwners, item.marker)) {
 			continue;
 		}
 
@@ -7249,7 +7441,16 @@ bool BuildBundleFromSections(
 		sections.program.header.debugCommandLine
 	};
 	std::vector<EComDependencyRecord> dependencyRecords;
-	(void)ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords);
+	if (!ParseEComDependencies(sections.ecomSectionBytes, dependencyRecords)) {
+		return false;
+	}
+	std::unordered_map<std::int32_t, size_t> dependencyDefinedIdOwners;
+	if (!TryBuildDependencyDefinedIdOwners(
+			sections,
+			dependencyRecords,
+			dependencyDefinedIdOwners)) {
+		return false;
+	}
 	const AnonymousTypeHints anonymousTypeHints = BuildAnonymousTypeHints(sections, sourcePath);
 	bundle.publicHeaderText = BuildPublicHeaderText(sections, sourcePath, dependencyRecords, anonymousTypeHints);
 	SymbolResolver resolver(
@@ -7262,7 +7463,7 @@ bool BuildBundleFromSections(
 	std::unordered_map<std::string, int> keyCounters;
 	for (const auto& pageInfo : sections.program.codePages) {
 		const auto functions = CollectPageFunctions(sections.program, pageInfo);
-		if (!ShouldKeepPage(sections, dependencyRecords, pageInfo, functions, true)) {
+		if (!ShouldKeepPage(sections, dependencyDefinedIdOwners, pageInfo, functions, true)) {
 			continue;
 		}
 		itemKeys.insert_or_assign(
@@ -7270,7 +7471,7 @@ bool BuildBundleFromSections(
 			BuildItemKey("class", ResolveProgramPageLogicalName(sections.program, pageInfo, resolver), keyCounters));
 	}
 	for (const auto& item : sections.program.globals) {
-		if (IsGlobalHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker)) {
+		if (IsGlobalHidden(item) || IsDependencyDefinedId(dependencyDefinedIdOwners, item.marker)) {
 			continue;
 		}
 		itemKeys.insert_or_assign(
@@ -7280,7 +7481,7 @@ bool BuildBundleFromSections(
 	for (const auto& item : sections.program.dataTypes) {
 		if (IsTxt2EPlaceholderStruct(item) ||
 			IsStructHidden(item) ||
-			IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
+			IsDependencyDefinedId(dependencyDefinedIdOwners, item.header.dwId)) {
 			continue;
 		}
 		itemKeys.insert_or_assign(
@@ -7288,7 +7489,7 @@ bool BuildBundleFromSections(
 			BuildItemKey("struct", resolver.ResolveUserName(item.header.dwId), keyCounters));
 	}
 	for (const auto& item : sections.program.dlls) {
-		if (IsDllHidden(item) || IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
+		if (IsDllHidden(item) || IsDependencyDefinedId(dependencyDefinedIdOwners, item.header.dwId)) {
 			continue;
 		}
 		itemKeys.insert_or_assign(
@@ -7296,7 +7497,7 @@ bool BuildBundleFromSections(
 			BuildItemKey("dll", resolver.ResolveUserName(item.header.dwId), keyCounters));
 	}
 	for (const auto& item : sections.resources.constants) {
-		if (IsConstantHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker)) {
+		if (IsConstantHidden(item) || IsDependencyDefinedId(dependencyDefinedIdOwners, item.marker)) {
 			continue;
 		}
 		const std::string prefix = item.pageType == kConstPageImage ? "image" : (item.pageType == kConstPageSound ? "sound" : "constant");
@@ -7331,7 +7532,7 @@ bool BuildBundleFromSections(
 			while (programPageIndex < sections.program.codePages.size()) {
 				const auto& candidate = sections.program.codePages[programPageIndex];
 				const auto functions = CollectPageFunctions(sections.program, candidate);
-				if (ShouldKeepPage(sections, dependencyRecords, candidate, functions, true)) {
+				if (ShouldKeepPage(sections, dependencyDefinedIdOwners, candidate, functions, true)) {
 					break;
 				}
 				++programPageIndex;
@@ -7407,7 +7608,7 @@ bool BuildBundleFromSections(
 		else if (page.typeName == "全局变量") {
 			bundle.globalText = JoinPageLines(page.lines);
 			for (const auto& item : sections.program.globals) {
-				if (IsGlobalHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker)) {
+				if (IsGlobalHidden(item) || IsDependencyDefinedId(dependencyDefinedIdOwners, item.marker)) {
 					continue;
 				}
 				BundleNativeGlobalSnapshot snapshot;
@@ -7423,7 +7624,7 @@ bool BuildBundleFromSections(
 			for (const auto& item : sections.program.dataTypes) {
 				if (IsTxt2EPlaceholderStruct(item) ||
 					IsStructHidden(item) ||
-					IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
+					IsDependencyDefinedId(dependencyDefinedIdOwners, item.header.dwId)) {
 					continue;
 				}
 				BundleNativeStructSnapshot snapshot;
@@ -7441,7 +7642,7 @@ bool BuildBundleFromSections(
 		else if (page.typeName == "DLL命令") {
 			bundle.dllDeclareText = JoinPageLines(page.lines);
 			for (const auto& item : sections.program.dlls) {
-				if (IsDllHidden(item) || IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
+				if (IsDllHidden(item) || IsDependencyDefinedId(dependencyDefinedIdOwners, item.header.dwId)) {
 					continue;
 				}
 				BundleNativeDllSnapshot snapshot;
@@ -7464,7 +7665,7 @@ bool BuildBundleFromSections(
 					item.valueText == "<图片>" ||
 					item.valueText == "<声音>" ||
 					IsConstantHidden(item) ||
-					IsDependencyDefinedId(dependencyRecords, item.marker)) {
+					IsDependencyDefinedId(dependencyDefinedIdOwners, item.marker)) {
 					continue;
 				}
 				BundleNativeConstantSnapshot snapshot;
@@ -7538,7 +7739,7 @@ bool BuildBundleFromSections(
 	for (const auto& item : sections.resources.constants) {
 		if ((item.pageType != kConstPageImage && item.pageType != kConstPageSound) ||
 			IsConstantHidden(item) ||
-			IsDependencyDefinedId(dependencyRecords, item.marker)) {
+			IsDependencyDefinedId(dependencyDefinedIdOwners, item.marker)) {
 			continue;
 		}
 
@@ -7604,7 +7805,7 @@ bool BuildBundleFromSections(
 
 	for (const auto& item : sections.program.codePages) {
 		const auto functions = CollectPageFunctions(sections.program, item);
-		if (!ShouldKeepPage(sections, dependencyRecords, item, functions, true)) {
+		if (!ShouldKeepPage(sections, dependencyDefinedIdOwners, item, functions, true)) {
 			continue;
 		}
 		appendRootItemKey(item.header.dwId);
@@ -7615,25 +7816,25 @@ bool BuildBundleFromSections(
 	for (const auto& item : sections.program.dataTypes) {
 		if (IsTxt2EPlaceholderStruct(item) ||
 			IsStructHidden(item) ||
-			IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
+			IsDependencyDefinedId(dependencyDefinedIdOwners, item.header.dwId)) {
 			continue;
 		}
 		appendRootItemKey(item.header.dwId);
 	}
 	for (const auto& item : sections.program.dlls) {
-		if (IsDllHidden(item) || IsDependencyDefinedId(dependencyRecords, item.header.dwId)) {
+		if (IsDllHidden(item) || IsDependencyDefinedId(dependencyDefinedIdOwners, item.header.dwId)) {
 			continue;
 		}
 		appendRootItemKey(item.header.dwId);
 	}
 	for (const auto& item : sections.program.globals) {
-		if (IsGlobalHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker)) {
+		if (IsGlobalHidden(item) || IsDependencyDefinedId(dependencyDefinedIdOwners, item.marker)) {
 			continue;
 		}
 		appendRootItemKey(item.marker);
 	}
 	for (const auto& item : sections.resources.constants) {
-		if (IsConstantHidden(item) || IsDependencyDefinedId(dependencyRecords, item.marker)) {
+		if (IsConstantHidden(item) || IsDependencyDefinedId(dependencyDefinedIdOwners, item.marker)) {
 			continue;
 		}
 		appendRootItemKey(item.marker);
@@ -7864,7 +8065,6 @@ bool ExtractNativeDependencySymbols(
 	}
 
 	outRecords.reserve(dependencyRecords.size());
-	std::vector<NativeDependencyRangeEvidence> rangeEvidence;
 	bool hasInvalidDefinedIdRange = false;
 	for (const auto& record : dependencyRecords) {
 		hasInvalidDefinedIdRange = hasInvalidDefinedIdRange || record.hasInvalidDefinedIdRange;
@@ -7879,58 +8079,34 @@ bool ExtractNativeDependencySymbols(
 					range.start,
 					range.count,
 				});
-				rangeEvidence.push_back(NativeDependencyRangeEvidence{
-					range.start,
-					range.count,
-					outRecords.size(),
-				});
 			}
 		}
 		outRecords.push_back(std::move(item));
 	}
-	const auto normalizeRangeType = [](const std::int32_t id) {
-		const std::int32_t type = epl_system_id::GetType(id);
-		if (type == epl_system_id::kTypeClass ||
-			type == epl_system_id::kTypeStaticClass ||
-			type == epl_system_id::kTypeFormClass) {
-			return epl_system_id::kTypeClass;
-		}
-		return type;
-	};
+	std::unordered_map<std::int32_t, size_t> definedIdOwners;
+	std::string definedIdReason;
 	if (hasInvalidDefinedIdRange ||
-		!ValidateNativeDependencyRanges(rangeEvidence, normalizeRangeType)) {
+		!TryBuildDependencyDefinedIdOwners(
+			sections,
+			dependencyRecords,
+			definedIdOwners,
+			&definedIdReason)) {
 		outRecords.clear();
 		if (outUnassigned != nullptr) {
 			*outUnassigned = {};
 		}
 		if (outError != nullptr) {
 			*outError = "invalid_ecom_defined_id_ranges";
+			if (!definedIdReason.empty()) {
+				*outError += ": " + definedIdReason;
+			}
 		}
 		return false;
 	}
 
 	const auto findRecordIndexById = [&](const std::int32_t id) -> size_t {
-		if ((id & epl_system_id::kMaskType) == 0) {
-			return dependencyRecords.size();
-		}
-		const std::int32_t idNum = id & epl_system_id::kMaskNum;
-		const std::int32_t idType = normalizeRangeType(id);
-		for (size_t recordIndex = 0; recordIndex < dependencyRecords.size(); ++recordIndex) {
-			for (const auto& range : dependencyRecords[recordIndex].definedIds) {
-				if (range.count <= 0) {
-					continue;
-				}
-				const std::int32_t rangeType = normalizeRangeType(range.start);
-				if (rangeType != idType) {
-					continue;
-				}
-				const std::int32_t startNum = range.start & epl_system_id::kMaskNum;
-				if (idNum >= startNum && idNum < startNum + range.count) {
-					return recordIndex;
-				}
-			}
-		}
-		return dependencyRecords.size();
+		const auto it = definedIdOwners.find(id);
+		return it == definedIdOwners.end() ? dependencyRecords.size() : it->second;
 	};
 
 	SymbolResolver resolver(
@@ -7945,8 +8121,25 @@ bool ExtractNativeDependencySymbols(
 		NativeDependencyClassSymbol classSymbol;
 		classSymbol.id = page.header.dwId;
 		classSymbol.memoryAddress = page.header.dwUnk;
+		classSymbol.formId = page.unk1;
 		classSymbol.baseClass = page.baseClass;
 		classSymbol.name = classNamesById[page.header.dwId];
+		classSymbol.comment = page.comment;
+		classSymbol.functionIds = page.functionIds;
+		classSymbol.variables.reserve(page.pageVars.size());
+		for (const auto& variable : page.pageVars) {
+			NativeDependencyClassVariableSymbol variableSymbol;
+			variableSymbol.id = variable.marker;
+			variableSymbol.dataType = variable.dataType;
+			variableSymbol.attr = variable.attr;
+			variableSymbol.name = TrimAsciiCopy(variable.name);
+			if (variableSymbol.name.empty()) {
+				variableSymbol.name = TrimAsciiCopy(resolver.ResolveUserName(variable.marker));
+			}
+			variableSymbol.comment = variable.comment;
+			variableSymbol.arrayBounds = variable.arrayBounds;
+			classSymbol.variables.push_back(std::move(variableSymbol));
+		}
 		if (recordIndex < outRecords.size()) {
 			outRecords[recordIndex].classes.push_back(std::move(classSymbol));
 		}
@@ -7954,6 +8147,24 @@ bool ExtractNativeDependencySymbols(
 			CanCollectUnassignedNativeDependencySymbol(NativeUnassignedSymbolKind::Class)) {
 			outUnassigned->classes.push_back(std::move(classSymbol));
 		}
+	}
+
+	for (const auto& variable : sections.program.globals) {
+		const size_t recordIndex = findRecordIndexById(variable.marker);
+		if (recordIndex >= outRecords.size()) {
+			continue;
+		}
+		NativeDependencyGlobalSymbol symbol;
+		symbol.id = variable.marker;
+		symbol.dataType = variable.dataType;
+		symbol.attr = variable.attr;
+		symbol.name = TrimAsciiCopy(variable.name);
+		if (symbol.name.empty()) {
+			symbol.name = TrimAsciiCopy(resolver.ResolveUserName(variable.marker));
+		}
+		symbol.comment = variable.comment;
+		symbol.arrayBounds = variable.arrayBounds;
+		outRecords[recordIndex].globals.push_back(std::move(symbol));
 	}
 
 	for (const auto& dataType : sections.program.dataTypes) {
@@ -7977,6 +8188,7 @@ bool ExtractNativeDependencySymbols(
 			if (memberSymbol.name.empty()) {
 				memberSymbol.name = TrimAsciiCopy(resolver.ResolveUserName(member.marker));
 			}
+			memberSymbol.comment = member.comment;
 			memberSymbol.arrayBounds = member.arrayBounds;
 			structSymbol.members.push_back(std::move(memberSymbol));
 		}
@@ -7987,6 +8199,42 @@ bool ExtractNativeDependencySymbols(
 			CanCollectUnassignedNativeDependencySymbol(NativeUnassignedSymbolKind::Struct)) {
 			outUnassigned->structs.push_back(std::move(structSymbol));
 		}
+	}
+
+	for (const auto& dll : sections.program.dlls) {
+		const size_t recordIndex = findRecordIndexById(dll.header.dwId);
+		if (recordIndex >= outRecords.size()) {
+			continue;
+		}
+		NativeDependencyDllSymbol symbol;
+		symbol.id = dll.header.dwId;
+		symbol.memoryAddress = dll.header.dwUnk;
+		symbol.attr = dll.attr;
+		symbol.returnType = dll.returnType;
+		symbol.name = TrimAsciiCopy(dll.name);
+		if (symbol.name.empty()) {
+			symbol.name = TrimAsciiCopy(resolver.ResolveUserName(dll.header.dwId));
+		}
+		symbol.comment = dll.comment;
+		symbol.fileName = dll.fileName;
+		symbol.commandName = dll.commandName;
+		symbol.paramIds.reserve(dll.params.size());
+		symbol.params.reserve(dll.params.size());
+		for (const auto& param : dll.params) {
+			symbol.paramIds.push_back(param.marker);
+			NativeDependencyVariableSymbol paramSymbol;
+			paramSymbol.id = param.marker;
+			paramSymbol.dataType = param.dataType;
+			paramSymbol.attr = param.attr;
+			paramSymbol.name = TrimAsciiCopy(param.name);
+			if (paramSymbol.name.empty()) {
+				paramSymbol.name = TrimAsciiCopy(resolver.ResolveUserName(param.marker));
+			}
+			paramSymbol.comment = param.comment;
+			paramSymbol.arrayBounds = param.arrayBounds;
+			symbol.params.push_back(std::move(paramSymbol));
+		}
+		outRecords[recordIndex].dlls.push_back(std::move(symbol));
 	}
 
 	for (const auto& function : sections.program.functions) {
@@ -8009,8 +8257,29 @@ bool ExtractNativeDependencySymbols(
 			paramSymbol.id = param.marker;
 			paramSymbol.dataType = param.dataType;
 			paramSymbol.attr = param.attr;
+			paramSymbol.name = TrimAsciiCopy(param.name);
+			if (paramSymbol.name.empty()) {
+				paramSymbol.name = TrimAsciiCopy(resolver.ResolveUserName(param.marker));
+			}
+			paramSymbol.comment = param.comment;
 			paramSymbol.arrayBounds = param.arrayBounds;
 			methodSymbol.params.push_back(std::move(paramSymbol));
+		}
+		methodSymbol.localIds.reserve(function.locals.size());
+		methodSymbol.locals.reserve(function.locals.size());
+		for (const auto& local : function.locals) {
+			methodSymbol.localIds.push_back(local.marker);
+			NativeDependencyMethodParamSymbol localSymbol;
+			localSymbol.id = local.marker;
+			localSymbol.dataType = local.dataType;
+			localSymbol.attr = local.attr;
+			localSymbol.name = TrimAsciiCopy(local.name);
+			if (localSymbol.name.empty()) {
+				localSymbol.name = TrimAsciiCopy(resolver.ResolveUserName(local.marker));
+			}
+			localSymbol.comment = local.comment;
+			localSymbol.arrayBounds = local.arrayBounds;
+			methodSymbol.locals.push_back(std::move(localSymbol));
 		}
 		methodSymbol.lineOffset = function.lineOffset;
 		methodSymbol.blockOffset = function.blockOffset;
@@ -8035,7 +8304,12 @@ bool ExtractNativeDependencySymbols(
 		}
 		NativeDependencyConstantSymbol constantSymbol;
 		constantSymbol.id = constant.marker;
+		constantSymbol.attr = constant.attr;
+		constantSymbol.pageType = static_cast<std::int32_t>(constant.pageType);
 		constantSymbol.name = name;
+		constantSymbol.comment = constant.comment;
+		constantSymbol.valueText = constant.valueText;
+		constantSymbol.rawData = constant.rawData;
 		if (recordIndex < outRecords.size()) {
 			outRecords[recordIndex].constants.push_back(std::move(constantSymbol));
 		}

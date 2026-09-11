@@ -102,12 +102,26 @@ struct DependencyDefinedIdRange {
 	std::int32_t count = 0;
 };
 
+// 原生工程里易模块导入类的成员变量符号。
+struct NativeDependencyClassVariableSymbol {
+	std::int32_t id = 0;
+	std::int32_t dataType = 0;
+	std::int16_t attr = 0;
+	std::string name;
+	std::string comment;
+	std::vector<std::int32_t> arrayBounds;
+};
+
 // 原生工程里易模块导入的公开类符号。
 struct NativeDependencyClassSymbol {
 	std::int32_t id = 0;
 	std::int32_t memoryAddress = 0;
+	std::int32_t formId = 0;
 	std::int32_t baseClass = 0;
 	std::string name;
+	std::string comment;
+	std::vector<std::int32_t> functionIds;
+	std::vector<NativeDependencyClassVariableSymbol> variables;
 };
 
 // 原生工程里易模块导入方法的参数符号。
@@ -115,6 +129,8 @@ struct NativeDependencyMethodParamSymbol {
 	std::int32_t id = 0;
 	std::int32_t dataType = 0;
 	std::int16_t attr = 0;
+	std::string name;
+	std::string comment;
 	std::vector<std::int32_t> arrayBounds;
 };
 
@@ -129,6 +145,8 @@ struct NativeDependencyMethodSymbol {
 	std::string name;
 	std::vector<std::int32_t> paramIds;
 	std::vector<NativeDependencyMethodParamSymbol> params;
+	std::vector<std::int32_t> localIds;
+	std::vector<NativeDependencyMethodParamSymbol> locals;
 	std::vector<std::uint8_t> lineOffset;
 	std::vector<std::uint8_t> blockOffset;
 	std::vector<std::uint8_t> methodReference;
@@ -140,7 +158,37 @@ struct NativeDependencyMethodSymbol {
 // 原生工程里易模块导入的公开常量符号。
 struct NativeDependencyConstantSymbol {
 	std::int32_t id = 0;
+	std::int16_t attr = 0;
+	std::int32_t pageType = 0;
 	std::string name;
+	std::string comment;
+	std::string valueText;
+	std::vector<std::uint8_t> rawData;
+};
+
+// 原生工程里易模块导入的公开变量或 DLL 参数符号。
+struct NativeDependencyVariableSymbol {
+	std::int32_t id = 0;
+	std::int32_t dataType = 0;
+	std::int16_t attr = 0;
+	std::string name;
+	std::string comment;
+	std::vector<std::int32_t> arrayBounds;
+};
+
+struct NativeDependencyGlobalSymbol : NativeDependencyVariableSymbol {};
+
+struct NativeDependencyDllSymbol {
+	std::int32_t id = 0;
+	std::int32_t memoryAddress = 0;
+	std::int32_t attr = 0;
+	std::int32_t returnType = 0;
+	std::string name;
+	std::string comment;
+	std::string fileName;
+	std::string commandName;
+	std::vector<std::int32_t> paramIds;
+	std::vector<NativeDependencyVariableSymbol> params;
 };
 
 // 原生工程里易模块导入的公开数据类型符号。
@@ -149,6 +197,7 @@ struct NativeDependencyStructMemberSymbol {
 	std::int32_t dataType = 0;
 	std::int16_t attr = 0;
 	std::string name;
+	std::string comment;
 	std::vector<std::int32_t> arrayBounds;
 };
 
@@ -167,7 +216,9 @@ struct NativeDependencySymbolRecord {
 	bool reExport = false;
 	std::vector<DependencyDefinedIdRange> definedIds;
 	std::vector<NativeDependencyClassSymbol> classes;
+	std::vector<NativeDependencyGlobalSymbol> globals;
 	std::vector<NativeDependencyStructSymbol> structs;
+	std::vector<NativeDependencyDllSymbol> dlls;
 	std::vector<NativeDependencyMethodSymbol> methods;
 	std::vector<NativeDependencyConstantSymbol> constants;
 };
