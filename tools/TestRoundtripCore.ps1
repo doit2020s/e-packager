@@ -804,6 +804,42 @@ if ($shapeVerifiedFirst.classId -ne $shapeVerifiedSecond.classId -or
     throw 'class shape rebuild is not stable across the second roundtrip'
 }
 
+# A saved ordinary assembly has a real native class address. Adding a class
+# variable changes that class layout, so retaining even the trusted original
+# address can make E 5.9 dereference the old layout while compiling a method
+# that accesses the new variable.
+$staticShapeOriginal = Get-SnapshotByMethod $kindProjection '_启动子程序'
+if ($staticShapeOriginal.classMemoryAddress -eq 0) {
+    throw 'static class shape probe requires a nonzero trusted original address'
+}
+$staticShapeWorkspace = Join-Path $OutputRoot 'static-class-shape-workspace'
+Copy-Item -LiteralPath $kindProjection -Destination $staticShapeWorkspace -Recurse
+$staticShapeSource = Join-Path $staticShapeWorkspace 'src\程序集1.txt'
+$staticShapeText = [IO.File]::ReadAllText($staticShapeSource)
+$staticShapeText = $staticShapeText.Replace(
+    '.程序集 程序集1',
+    ".程序集 程序集1`r`n.程序集变量 ProbeStaticState, 整数型")
+$staticShapeText = [regex]::Replace(
+    $staticShapeText,
+    '(?m)^返回 \(0\).*$',
+    "ProbeStaticState ＝ 12`r`n返回 (ProbeStaticState)")
+Write-EText $staticShapeSource $staticShapeText
+$staticShapeCandidate = Join-Path $OutputRoot 'static-class-shape.e'
+$staticShapeProjection = Join-Path $OutputRoot 'static-class-shape-unpacked'
+Invoke-Packager @('pack', $staticShapeWorkspace, $staticShapeCandidate)
+Invoke-Packager @('unpack', $staticShapeCandidate, $staticShapeProjection, '--main-only')
+$staticShapeOutput = Get-SnapshotByMethod $staticShapeProjection '_启动子程序'
+if ($staticShapeOutput.classId -ne $staticShapeOriginal.classId) {
+    throw 'static class shape change discarded the compatible owner identity'
+}
+if ($staticShapeOutput.classMemoryAddress -ne 0) {
+    throw "static class shape change retained trusted original address: $($staticShapeOutput.classMemoryAddress)"
+}
+if (@($staticShapeOutput.classVarIds).Count -ne 1 -or
+    -not (Test-NativeInt32Value $staticShapeOutput.methods[0].expressionData $staticShapeOutput.classVarIds[0])) {
+    throw 'static class shape change did not encode the new class-variable access'
+}
+
 # Adding/removing/reordering methods changes the class method table and invalidates
 # the old class block address. Existing exact method payloads remain reusable when
 # they do not reference a removed or signature-changed method identity.
@@ -2076,6 +2112,7 @@ $result = [ordered]@{
 	header_kind_ordinary_second_projection_sha256 = $secondOrdinaryProjectionHash.ToLowerInvariant()
 	header_kind_roundtrip_stable = $true
 	header_kind_untrusted_snapshot_repaired = $true
+	static_class_shape_trusted_address_invalidated = $true
 	removed_method_reference_rejected = $true
 	object_method_self_call_id = ('0x{0:X8}' -f [int]$objectMethod.id)
 	object_method_qualified_call_bound = $true

@@ -13760,10 +13760,10 @@ bool BuildRestoreModel(
 			item.id = nativeSourceSnapshot->classId;
 			const BundleNativeSourceFileSnapshot* trustedOriginalSnapshot =
 				findTrustedOriginalClassSnapshot(nativeSourceSnapshot);
-			item.memoryAddress = trustedOriginalSnapshot != nullptr
-				? trustedOriginalSnapshot->classMemoryAddress
-				: ((changedClassShapes[classIndex] || changedClassMethodInventories[classIndex])
-					? 0
+			item.memoryAddress = changedClassShapes[classIndex] || changedClassMethodInventories[classIndex]
+				? 0
+				: (trustedOriginalSnapshot != nullptr
+					? trustedOriginalSnapshot->classMemoryAddress
 					: nativeSourceSnapshot->classMemoryAddress);
 			item.formId = nativeSourceSnapshot->formId;
 		}
