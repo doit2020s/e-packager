@@ -1304,8 +1304,22 @@ $crossControlStartProgram = @"
 .子程序 __启动窗口_创建完毕
 
 超级列表框1.置标题 (0, 0, “probe”)
+
 "@
 Write-EText $crossControlStartProgramPath $crossControlStartProgram
+
+$sharedOwnerClassName = 'SharedOwnerProbe'
+$sharedOwnerSourcePath = Join-Path $crossControlWorkspace "src\$sharedOwnerClassName.txt"
+$sharedOwnerSourceText = @'
+.版本 2
+
+.程序集 SharedOwnerProbe, , 公开
+
+.子程序 ProbeSharedName, 整数型, 公开
+
+返回 (101)
+'@
+Write-EText $sharedOwnerSourcePath $sharedOwnerSourceText
 
 $crossControlFormName = 'CrossFormProbe'
 $crossControlClassName = '窗口程序集_CrossFormProbe'
@@ -1329,6 +1343,19 @@ $crossControlClassText = @'
     返回 (_启动窗口.左边 ＋ CrossFormProbe.宽度)
 .如果真结束
 返回 (0)
+
+.子程序 ProbeSharedName, 整数型, 公开
+
+返回 (202)
+
+.子程序 ProbeLocalSharedCall, 整数型
+
+返回 (ProbeSharedName ())
+
+.子程序 ProbeQualifiedSharedCall
+.局部变量 owner, SharedOwnerProbe
+
+owner.ProbeSharedName ()
 
 .子程序 ProbeBooleanTrue, 逻辑型
 
@@ -1418,26 +1445,9 @@ for ($offset = 0; $offset + 2 -lt $staleOwnerExpression.Length; $offset++) {
 	}
 }
 if ($staleOwnerTrueRewriteCount -ne 1) {
-	throw "cross-form stale-owner boolean fixture rewrite mismatch: $staleOwnerTrueRewriteCount"
+	throw "cross-form reusable-line boolean fixture rewrite mismatch: $staleOwnerTrueRewriteCount"
 }
 $staleOwnerMethod.expressionData = [Convert]::ToBase64String($staleOwnerExpression)
-$staleTrueMethod = @($staleOwnerNativeMap.methods | Where-Object { $_.name -eq 'ProbeBooleanTrue' })[0]
-if ($null -eq $staleTrueMethod) { throw 'native boolean stale fixture method missing' }
-$staleTrueExpression = [Convert]::FromBase64String($staleTrueMethod.expressionData)
-$staleTrueRewriteCount = 0
-for ($offset = 0; $offset + 2 -lt $staleTrueExpression.Length; $offset++) {
-	if ($staleTrueExpression[$offset] -eq 0x18 -and
-		$staleTrueExpression[$offset + 1] -eq 0xFF -and
-		$staleTrueExpression[$offset + 2] -eq 0xFF) {
-		$staleTrueExpression[$offset + 1] = 0x01
-		$staleTrueExpression[$offset + 2] = 0x00
-		$staleTrueRewriteCount++
-	}
-}
-if ($staleTrueRewriteCount -ne 1) {
-	throw "native boolean stale fixture rewrite mismatch: $staleTrueRewriteCount"
-}
-$staleTrueMethod.expressionData = [Convert]::ToBase64String($staleTrueExpression)
 Write-EText $staleOwnerNativeMapPath ((ConvertTo-Json -InputObject $staleOwnerNativeMap -Depth 100) + "`r`n")
 Invoke-Packager @('pack', $crossControlStaleOwnerWorkspace, $crossControlCandidate2)
 Invoke-Packager @('unpack', $crossControlCandidate2, $crossControlUnpacked2, '--main-only')
@@ -1445,6 +1455,8 @@ Invoke-Packager @('compare-bundle', $crossControlCandidate2, $crossControlUnpack
 
 $crossControlExpectedLine = '返回 (_启动窗口.超级列表框1.取标题 (_启动窗口.超级列表框1.现行选中项, 1))'
 $crossFormOwnerExpectedLine = '返回 (_启动窗口.左边 ＋ CrossFormProbe.宽度)'
+$localSharedCallExpectedLine = '返回 (ProbeSharedName ())'
+$qualifiedSharedCallExpectedLine = 'owner.ProbeSharedName ()'
 $booleanTrueExpectedLine = '返回 (真)'
 $booleanFalseExpectedLine = '返回 (假)'
 $additiveAssociativityLine = '返回 (10 ＋ 3 － 2)'
@@ -1456,6 +1468,8 @@ foreach ($crossControlSource in @($crossControlSource1, $crossControlSource2)) {
     $projection = [IO.File]::ReadAllText($crossControlSource)
     if (-not $projection.Contains($crossControlExpectedLine) -or
         -not $projection.Contains($crossFormOwnerExpectedLine) -or
+        -not $projection.Contains($localSharedCallExpectedLine) -or
+        -not $projection.Contains($qualifiedSharedCallExpectedLine) -or
         -not $projection.Contains($booleanTrueExpectedLine) -or
         -not $projection.Contains($booleanFalseExpectedLine) -or
         -not $projection.Contains($additiveAssociativityLine) -or
@@ -1485,6 +1499,8 @@ $canonicalTrueLiteral = [byte[]](0x18, 0xFF, 0xFF)
 $positiveTrueLiteral = [byte[]](0x18, 0x01, 0x00)
 $canonicalFalseLiteral = [byte[]](0x18, 0x00, 0x00)
 $crossControlIds = [Collections.Generic.List[int]]::new()
+$sharedBindingIds = [Collections.Generic.List[string]]::new()
+$crossControlRoundIndex = 0
 foreach ($crossControlUnpacked in @($crossControlUnpacked1, $crossControlUnpacked2)) {
     $nativeMap = @(Get-Content -LiteralPath (Join-Path $crossControlUnpacked 'project\.native_source_map.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
     $method = @($nativeMap.methods | Where-Object { $_.name -eq 'ProbeCrossFormControl' })[0]
@@ -1495,18 +1511,6 @@ foreach ($crossControlUnpacked in @($crossControlUnpacked1, $crossControlUnpacke
         (Get-NativeByteSequenceCount $expression $crossControlLegacyMember) -ne 0) {
         throw ('cross-form support member did not use canonical owner type 0x{0:X8}' -f $iextControlTypeId)
     }
-	$booleanTrueMethod = @($nativeMap.methods | Where-Object { $_.name -eq 'ProbeBooleanTrue' })[0]
-	$booleanFalseMethod = @($nativeMap.methods | Where-Object { $_.name -eq 'ProbeBooleanFalse' })[0]
-	if ($null -eq $booleanTrueMethod -or $null -eq $booleanFalseMethod) {
-		throw 'native boolean regression methods missing'
-	}
-	$booleanTrueExpression = [Convert]::FromBase64String($booleanTrueMethod.expressionData)
-	$booleanFalseExpression = [Convert]::FromBase64String($booleanFalseMethod.expressionData)
-	if ((Get-NativeByteSequenceCount $booleanTrueExpression $canonicalTrueLiteral) -ne 1 -or
-		(Get-NativeByteSequenceCount $booleanTrueExpression $positiveTrueLiteral) -ne 0 -or
-		(Get-NativeByteSequenceCount $booleanFalseExpression $canonicalFalseLiteral) -ne 1) {
-		throw 'native boolean literal encoding is not canonical -1/0'
-	}
     $symbolMap = Get-Content -LiteralPath (Join-Path $crossControlUnpacked 'project\.native_symbol_map.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 	$startFormSnapshot = @($symbolMap.forms | Where-Object { $_.name -eq $controlWindowName })[0]
 	$probeFormSnapshot = @($symbolMap.forms | Where-Object { $_.name -eq $crossControlFormName })[0]
@@ -1539,10 +1543,70 @@ foreach ($crossControlUnpacked in @($crossControlUnpacked1, $crossControlUnpacke
 	if ($builtinFormOwnerCount -ne 0) {
 		throw 'cross-form support member encoded the support alias instead of the concrete form owner'
 	}
+	# Repairing a stale owner requires semantic re-encoding of that line, so true uses
+	# the canonical semantic representation. The separate unchanged method below
+	# proves that reusable snapshots preserve their original positive-one encoding.
 	if ((Get-NativeByteSequenceCount $formOwnerExpression $canonicalTrueLiteral) -ne 1 -or
 		(Get-NativeByteSequenceCount $formOwnerExpression $positiveTrueLiteral) -ne 0) {
-		throw 'reusable native line rebuild did not canonicalize a true literal'
+		throw 'repaired native line did not use the semantic logical true representation'
 	}
+	$booleanTrueMethod = @($nativeMap.methods | Where-Object { $_.name -eq 'ProbeBooleanTrue' })[0]
+	$booleanFalseMethod = @($nativeMap.methods | Where-Object { $_.name -eq 'ProbeBooleanFalse' })[0]
+	if ($null -eq $booleanTrueMethod -or $null -eq $booleanFalseMethod) {
+		throw 'native boolean regression methods missing'
+	}
+	$booleanTrueExpression = [Convert]::FromBase64String($booleanTrueMethod.expressionData)
+	$booleanFalseExpression = [Convert]::FromBase64String($booleanFalseMethod.expressionData)
+	if ((Get-NativeByteSequenceCount $booleanTrueExpression $canonicalTrueLiteral) -ne 1 -or
+		(Get-NativeByteSequenceCount $booleanTrueExpression $positiveTrueLiteral) -ne 0 -or
+		(Get-NativeByteSequenceCount $booleanFalseExpression $canonicalFalseLiteral) -ne 1) {
+		throw 'semantic boolean encoding or unchanged native snapshot preservation failed'
+	}
+	$unpackedMeta = Get-Content -LiteralPath (Join-Path $crossControlUnpacked 'project\_meta.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+	$ownerClassIndex = -1
+	$probeClassIndex = -1
+	for ($sourceIndex = 0; $sourceIndex -lt $unpackedMeta.sourceFiles.Count; $sourceIndex++) {
+		if ($unpackedMeta.sourceFiles[$sourceIndex].logicalName -eq $sharedOwnerClassName) {
+			$ownerClassIndex = $sourceIndex
+		}
+		elseif ($unpackedMeta.sourceFiles[$sourceIndex].logicalName -eq $crossControlClassName) {
+			$probeClassIndex = $sourceIndex
+		}
+	}
+	if ($ownerClassIndex -lt 0 -or $probeClassIndex -lt 0) {
+		throw 'same-name native function regression classes missing'
+	}
+	$ownerSharedMethod = @($nativeMap[$ownerClassIndex].methods | Where-Object { $_.name -eq 'ProbeSharedName' })[0]
+	$probeSharedMethod = @($nativeMap[$probeClassIndex].methods | Where-Object { $_.name -eq 'ProbeSharedName' })[0]
+	$localSharedCallMethod = @($nativeMap[$probeClassIndex].methods | Where-Object { $_.name -eq 'ProbeLocalSharedCall' })[0]
+	$qualifiedSharedCallMethod = @($nativeMap[$probeClassIndex].methods | Where-Object { $_.name -eq 'ProbeQualifiedSharedCall' })[0]
+	if ($null -eq $ownerSharedMethod -or $null -eq $probeSharedMethod -or
+		$null -eq $localSharedCallMethod -or $null -eq $qualifiedSharedCallMethod) {
+		throw 'same-name native function regression methods missing'
+	}
+	$ownerSharedCall = [byte[]](@(0x21) +
+		[BitConverter]::GetBytes([int]$ownerSharedMethod.id) +
+		[BitConverter]::GetBytes([int16]-2))
+	$probeSharedCall = [byte[]](@(0x21) +
+		[BitConverter]::GetBytes([int]$probeSharedMethod.id) +
+		[BitConverter]::GetBytes([int16]-2))
+	$qualifiedOwnerSharedCall = [byte[]](@(0x6A) +
+		[BitConverter]::GetBytes([int]$ownerSharedMethod.id) +
+		[BitConverter]::GetBytes([int16]-2))
+	$qualifiedProbeSharedCall = [byte[]](@(0x6A) +
+		[BitConverter]::GetBytes([int]$probeSharedMethod.id) +
+		[BitConverter]::GetBytes([int16]-2))
+	$localSharedExpression = [Convert]::FromBase64String($localSharedCallMethod.expressionData)
+	$qualifiedSharedExpression = [Convert]::FromBase64String($qualifiedSharedCallMethod.expressionData)
+	if ((Get-NativeByteSequenceCount $localSharedExpression $probeSharedCall) -ne 1 -or
+		(Get-NativeByteSequenceCount $localSharedExpression $ownerSharedCall) -ne 0) {
+		throw 'unqualified same-name call did not bind to the current assembly'
+	}
+	if ((Get-NativeByteSequenceCount $qualifiedSharedExpression $qualifiedOwnerSharedCall) -ne 1 -or
+		(Get-NativeByteSequenceCount $qualifiedSharedExpression $qualifiedProbeSharedCall) -ne 0) {
+		throw 'qualified same-name call did not bind through its target owner'
+	}
+	$sharedBindingIds.Add(('{0}:{1}' -f [int]$ownerSharedMethod.id, [int]$probeSharedMethod.id))
     $controlSnapshot = @($symbolMap.forms.elements | Where-Object { $_.name -eq '超级列表框1' })[0]
     if ($null -eq $controlSnapshot) { throw 'cross-form current control identity missing' }
 	if ([int]$controlSnapshot.dataType -ne $iextControlTypeId) {
@@ -1551,9 +1615,165 @@ foreach ($crossControlUnpacked in @($crossControlUnpacked1, $crossControlUnpacke
 			$iextControlTypeId)
 	}
     $crossControlIds.Add([int]$controlSnapshot.id)
+	$crossControlRoundIndex++
 }
 if ($crossControlIds.Count -ne 2 -or $crossControlIds[0] -ne $crossControlIds[1]) {
     throw 'cross-form control id changed during the second roundtrip'
+}
+if ($sharedBindingIds.Count -ne 2 -or $sharedBindingIds[0] -ne $sharedBindingIds[1]) {
+	throw 'same-name function identities changed during the second roundtrip'
+}
+
+# Native snapshots from E projects legitimately use both 1 and -1 for logical
+# true. A dependency-free fixture makes the JSON snapshot the sole authority,
+# then verifies that an unchanged positive-one snapshot survives two packs.
+$booleanSeedWorkspace = Join-Path $OutputRoot 'boolean-snapshot-seed-workspace'
+Copy-TestWorkspace $consoleWorkspace $booleanSeedWorkspace
+$booleanSeedProgram = Get-ChildItem -LiteralPath (Join-Path $booleanSeedWorkspace 'src') -Filter '*.txt' -File |
+	Where-Object { -not $_.Name.StartsWith('.') } |
+	Select-Object -First 1
+if ($null -eq $booleanSeedProgram) { throw 'boolean snapshot seed source missing' }
+Write-EText $booleanSeedProgram.FullName @'
+.版本 2
+
+.程序集 程序集1
+
+.子程序 ProbeBooleanTrue, 逻辑型
+
+返回 (真)
+
+.子程序 ProbeBooleanFalse, 逻辑型
+
+返回 (假)
+
+.子程序 ProbeSharedName, 整数型, 公开
+
+返回 (202)
+
+.子程序 ProbeLocalSharedCall, 整数型
+
+返回 (ProbeSharedName ())
+'@
+$booleanOwnerClassName = 'BooleanSharedOwnerProbe'
+$booleanOwnerSourcePath = Join-Path $booleanSeedWorkspace "src\$booleanOwnerClassName.txt"
+Write-EText $booleanOwnerSourcePath @'
+.版本 2
+
+.程序集 BooleanSharedOwnerProbe, , 公开
+
+.子程序 ProbeSharedName, 整数型, 公开
+
+返回 (101)
+'@
+$booleanSeedMetaPath = Join-Path $booleanSeedWorkspace 'project\_meta.json'
+$booleanSeedMeta = Get-Content -LiteralPath $booleanSeedMetaPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$booleanSeedMeta.sourceFiles = @($booleanSeedMeta.sourceFiles) + @([pscustomobject]@{
+	key = "class:$booleanOwnerClassName"
+	logicalName = $booleanOwnerClassName
+	relativePath = "src/$booleanOwnerClassName.txt"
+})
+$booleanSeedMeta.rootChildKeys = @($booleanSeedMeta.rootChildKeys) + "class:$booleanOwnerClassName"
+Write-EText $booleanSeedMetaPath (($booleanSeedMeta | ConvertTo-Json -Depth 20) + "`r`n")
+$booleanSeedCandidate = Join-Path $OutputRoot 'boolean-snapshot-seed.e'
+$booleanSeedUnpacked = Join-Path $OutputRoot 'boolean-snapshot-seed-unpacked'
+Invoke-Packager @('pack', $booleanSeedWorkspace, $booleanSeedCandidate)
+Invoke-Packager @('unpack', $booleanSeedCandidate, $booleanSeedUnpacked, '--main-only')
+$booleanPositiveWorkspace = Join-Path $OutputRoot 'boolean-snapshot-positive-workspace'
+Copy-TestWorkspace $booleanSeedUnpacked $booleanPositiveWorkspace
+$booleanPositiveMapPath = Join-Path $booleanPositiveWorkspace 'project\.native_source_map.json'
+$booleanPositiveMap = @(Get-Content -LiteralPath $booleanPositiveMapPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+$booleanPositiveMethod = @($booleanPositiveMap.methods | Where-Object { $_.name -eq 'ProbeBooleanTrue' })[0]
+if ($null -eq $booleanPositiveMethod) { throw 'boolean positive-one native snapshot method missing' }
+$booleanPositiveExpression = [Convert]::FromBase64String($booleanPositiveMethod.expressionData)
+$booleanPositiveRewriteCount = 0
+for ($offset = 0; $offset + 2 -lt $booleanPositiveExpression.Length; $offset++) {
+	if ($booleanPositiveExpression[$offset] -eq 0x18 -and
+		$booleanPositiveExpression[$offset + 1] -eq 0xFF -and
+		$booleanPositiveExpression[$offset + 2] -eq 0xFF) {
+		$booleanPositiveExpression[$offset + 1] = 0x01
+		$booleanPositiveExpression[$offset + 2] = 0x00
+		$booleanPositiveRewriteCount++
+	}
+}
+if ($booleanPositiveRewriteCount -ne 1) {
+	throw "boolean positive-one native snapshot rewrite mismatch: $booleanPositiveRewriteCount"
+}
+$booleanPositiveMethod.expressionData = [Convert]::ToBase64String($booleanPositiveExpression)
+$booleanCurrentClass = @($booleanPositiveMap | Where-Object { $_.methods.name -contains 'ProbeLocalSharedCall' })[0]
+$booleanOwnerClass = @($booleanPositiveMap | Where-Object {
+	$_.methods.name -contains 'ProbeSharedName' -and $_.methods.name -notcontains 'ProbeLocalSharedCall'
+})[0]
+if ($null -eq $booleanCurrentClass -or $null -eq $booleanOwnerClass) {
+	throw 'boolean same-name stale snapshot classes missing'
+}
+$booleanCurrentSharedMethod = @($booleanCurrentClass.methods | Where-Object { $_.name -eq 'ProbeSharedName' })[0]
+$booleanOwnerSharedMethod = @($booleanOwnerClass.methods | Where-Object { $_.name -eq 'ProbeSharedName' })[0]
+$booleanStaleLocalCallMethod = @($booleanCurrentClass.methods | Where-Object { $_.name -eq 'ProbeLocalSharedCall' })[0]
+if ($null -eq $booleanCurrentSharedMethod -or $null -eq $booleanOwnerSharedMethod -or
+	$null -eq $booleanStaleLocalCallMethod) {
+	throw 'boolean same-name stale snapshot methods missing'
+}
+$booleanStaleLocalCallReferences = [Convert]::FromBase64String($booleanStaleLocalCallMethod.methodReference)
+if ($booleanStaleLocalCallReferences.Length -ne 4) {
+	throw 'boolean same-name stale snapshot method reference mismatch'
+}
+$booleanStaleLocalCallOffset = [BitConverter]::ToInt32($booleanStaleLocalCallReferences, 0)
+$booleanStaleLocalCallExpression = [Convert]::FromBase64String($booleanStaleLocalCallMethod.expressionData)
+if ($booleanStaleLocalCallOffset -lt 0 -or
+	$booleanStaleLocalCallOffset + 5 -gt $booleanStaleLocalCallExpression.Length -or
+	$booleanStaleLocalCallExpression[$booleanStaleLocalCallOffset] -ne 0x21 -or
+	[BitConverter]::ToInt32($booleanStaleLocalCallExpression, $booleanStaleLocalCallOffset + 1) -ne [int]$booleanCurrentSharedMethod.id) {
+	throw 'boolean same-name stale snapshot call encoding mismatch'
+}
+[BitConverter]::GetBytes([int]$booleanOwnerSharedMethod.id).CopyTo(
+	$booleanStaleLocalCallExpression,
+	$booleanStaleLocalCallOffset + 1)
+$booleanStaleLocalCallMethod.expressionData = [Convert]::ToBase64String($booleanStaleLocalCallExpression)
+Write-EText $booleanPositiveMapPath ((ConvertTo-Json -InputObject $booleanPositiveMap -Depth 100) + "`r`n")
+[IO.File]::Delete((Join-Path $booleanPositiveWorkspace 'project\.native_source.bin'))
+$booleanPositiveCandidate1 = Join-Path $OutputRoot 'boolean-snapshot-positive-1.e'
+$booleanPositiveUnpacked1 = Join-Path $OutputRoot 'boolean-snapshot-positive-unpacked-1'
+$booleanPositiveCandidate2 = Join-Path $OutputRoot 'boolean-snapshot-positive-2.e'
+$booleanPositiveUnpacked2 = Join-Path $OutputRoot 'boolean-snapshot-positive-unpacked-2'
+Invoke-Packager @('pack', $booleanPositiveWorkspace, $booleanPositiveCandidate1)
+Invoke-Packager @('unpack', $booleanPositiveCandidate1, $booleanPositiveUnpacked1, '--main-only')
+Invoke-Packager @('compare-bundle', $booleanPositiveCandidate1, $booleanPositiveUnpacked1)
+Invoke-Packager @('pack', $booleanPositiveUnpacked1, $booleanPositiveCandidate2)
+Invoke-Packager @('unpack', $booleanPositiveCandidate2, $booleanPositiveUnpacked2, '--main-only')
+Invoke-Packager @('compare-bundle', $booleanPositiveCandidate2, $booleanPositiveUnpacked2)
+foreach ($booleanPositiveUnpacked in @($booleanPositiveUnpacked1, $booleanPositiveUnpacked2)) {
+	$booleanPositiveRoundMap = @(Get-Content -LiteralPath (Join-Path $booleanPositiveUnpacked 'project\.native_source_map.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
+	$booleanPositiveRoundTrue = @($booleanPositiveRoundMap.methods | Where-Object { $_.name -eq 'ProbeBooleanTrue' })[0]
+	$booleanPositiveRoundFalse = @($booleanPositiveRoundMap.methods | Where-Object { $_.name -eq 'ProbeBooleanFalse' })[0]
+	$booleanPositiveRoundCurrentClass = @($booleanPositiveRoundMap | Where-Object { $_.methods.name -contains 'ProbeLocalSharedCall' })[0]
+	$booleanPositiveRoundOwnerClass = @($booleanPositiveRoundMap | Where-Object {
+		$_.methods.name -contains 'ProbeSharedName' -and $_.methods.name -notcontains 'ProbeLocalSharedCall'
+	})[0]
+	if ($null -eq $booleanPositiveRoundTrue -or $null -eq $booleanPositiveRoundFalse -or
+		$null -eq $booleanPositiveRoundCurrentClass -or $null -eq $booleanPositiveRoundOwnerClass) {
+		throw 'boolean positive-one roundtrip methods missing'
+	}
+	$booleanPositiveRoundTrueExpression = [Convert]::FromBase64String($booleanPositiveRoundTrue.expressionData)
+	$booleanPositiveRoundFalseExpression = [Convert]::FromBase64String($booleanPositiveRoundFalse.expressionData)
+	if ((Get-NativeByteSequenceCount $booleanPositiveRoundTrueExpression $positiveTrueLiteral) -ne 1 -or
+		(Get-NativeByteSequenceCount $booleanPositiveRoundTrueExpression $canonicalTrueLiteral) -ne 0 -or
+		(Get-NativeByteSequenceCount $booleanPositiveRoundFalseExpression $canonicalFalseLiteral) -ne 1) {
+		throw 'unchanged native logical snapshot representation was not preserved'
+	}
+	$booleanPositiveRoundCurrentShared = @($booleanPositiveRoundCurrentClass.methods | Where-Object { $_.name -eq 'ProbeSharedName' })[0]
+	$booleanPositiveRoundOwnerShared = @($booleanPositiveRoundOwnerClass.methods | Where-Object { $_.name -eq 'ProbeSharedName' })[0]
+	$booleanPositiveRoundLocalCall = @($booleanPositiveRoundCurrentClass.methods | Where-Object { $_.name -eq 'ProbeLocalSharedCall' })[0]
+	$booleanPositiveRoundCurrentCallBytes = [byte[]](@(0x21) +
+		[BitConverter]::GetBytes([int]$booleanPositiveRoundCurrentShared.id) +
+		[BitConverter]::GetBytes([int16]-2))
+	$booleanPositiveRoundOwnerCallBytes = [byte[]](@(0x21) +
+		[BitConverter]::GetBytes([int]$booleanPositiveRoundOwnerShared.id) +
+		[BitConverter]::GetBytes([int16]-2))
+	$booleanPositiveRoundLocalCallExpression = [Convert]::FromBase64String($booleanPositiveRoundLocalCall.expressionData)
+	if ((Get-NativeByteSequenceCount $booleanPositiveRoundLocalCallExpression $booleanPositiveRoundCurrentCallBytes) -ne 1 -or
+		(Get-NativeByteSequenceCount $booleanPositiveRoundLocalCallExpression $booleanPositiveRoundOwnerCallBytes) -ne 0) {
+		throw 'stale unqualified same-name native call was not repaired to its local assembly'
+	}
 }
 
 if ($rawHandlerFailureEvidence.Count -ne 9) {
@@ -1578,6 +1798,10 @@ $result = [ordered]@{
     cross_form_control_owner_type = ('0x{0:X8}' -f $iextControlTypeId)
     cross_form_control_projection_sha256 = (Get-FileHash -LiteralPath $crossControlSource1 -Algorithm SHA256).Hash.ToLowerInvariant()
     cross_form_control_second_projection_sha256 = (Get-FileHash -LiteralPath $crossControlSource2 -Algorithm SHA256).Hash.ToLowerInvariant()
+	same_name_function_ids = $sharedBindingIds[0]
+	stale_same_name_snapshot_repaired = $true
+	semantic_true_encoding = '0xFFFF'
+	preserved_snapshot_true_encoding = '0x0001'
     raw_form_handler_id = ('0x{0:X8}' -f $nativeHandlerId)
     raw_form_handler_alias = $rawHandlerAlias
     raw_form_handler_positive_sha256 = (Get-FileHash -LiteralPath $rawHandlerPositive -Algorithm SHA256).Hash.ToLowerInvariant()

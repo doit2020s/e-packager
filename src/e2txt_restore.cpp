@@ -4486,6 +4486,7 @@ struct NativeObjectMethodEncodeContext {
 	// candidates so a same-named E support command keeps the IDE's binding.
 	std::unordered_map<std::string, NativeFunctionSymbol> localFunctionsByName;
 	std::unordered_map<std::string, NativeFunctionSymbol> functionsByName;
+	std::unordered_map<std::int32_t, std::string> functionNamesById;
 	std::unordered_map<std::int32_t, std::unordered_map<std::string, NativeFunctionSymbol>> methodsByOwnerType;
 	// A window assembly may call methods from its bound support Window type without an explicit target.
 	std::int32_t implicitSupportTypeId = 0;
@@ -4530,6 +4531,75 @@ bool HasNonCanonicalAliasedMemberOwnerBinding(
 		}
 	}
 	return false;
+}
+
+size_t RepairMismatchedUnqualifiedLocalFunctionBindings(
+	std::vector<std::uint8_t>& expressionData,
+	const std::vector<std::int32_t>& methodReferences,
+	const NativeObjectMethodEncodeContext& context)
+{
+	size_t repairCount = 0;
+	for (const std::int32_t reference : methodReferences) {
+		if (reference < 0) {
+			continue;
+		}
+		const size_t callOffset = static_cast<size_t>(reference);
+		if (callOffset + 9 > expressionData.size() ||
+			(expressionData[callOffset] != 0x21 && expressionData[callOffset] != 0x6A)) {
+			continue;
+		}
+
+		std::int32_t referencedMethodId = 0;
+		std::int16_t libraryId = 0;
+		std::memcpy(
+			&referencedMethodId,
+			expressionData.data() + callOffset + 1,
+			sizeof(referencedMethodId));
+		std::memcpy(
+			&libraryId,
+			expressionData.data() + callOffset + 5,
+			sizeof(libraryId));
+		if (libraryId != -2 && libraryId != -3) {
+			continue;
+		}
+
+		size_t cursor = callOffset + 9;
+		bool validHeader = true;
+		for (int stringIndex = 0; stringIndex < 2; ++stringIndex) {
+			if (cursor + sizeof(std::int32_t) > expressionData.size()) {
+				validHeader = false;
+				break;
+			}
+			std::int32_t byteLength = 0;
+			std::memcpy(&byteLength, expressionData.data() + cursor, sizeof(byteLength));
+			cursor += sizeof(byteLength);
+			if (byteLength < 0 ||
+				static_cast<size_t>(byteLength) > expressionData.size() - cursor) {
+				validHeader = false;
+				break;
+			}
+			cursor += static_cast<size_t>(byteLength);
+		}
+		if (!validHeader || cursor >= expressionData.size() || expressionData[cursor] != 0x36) {
+			// A 0x38 target marks a qualified call and is resolved through its owner.
+			continue;
+		}
+
+		const auto referencedNameIt = context.functionNamesById.find(referencedMethodId);
+		if (referencedNameIt == context.functionNamesById.end()) {
+			continue;
+		}
+		const auto localIt = context.localFunctionsByName.find(referencedNameIt->second);
+		if (localIt != context.localFunctionsByName.end() &&
+			localIt->second.methodId != referencedMethodId) {
+			std::memcpy(
+				expressionData.data() + callOffset + 1,
+				&localIt->second.methodId,
+				sizeof(localIt->second.methodId));
+			++repairCount;
+		}
+	}
+	return repairCount;
 }
 
 bool HasNonCanonicalAliasedMemberOwnerBinding(
@@ -5841,6 +5911,9 @@ bool TryEncodeNativeExpression(
 
 	if (const auto boolValue = ParseBoolLiteral(expression); boolValue.has_value()) {
 		writer.WriteU8(0x18);
+		// E 5.9 semantic rebuilds encode logical true as -1. Native snapshots
+		// retain their original representation because both 1 and -1 occur in
+		// compiler-produced project history.
 		writer.WriteI16(*boolValue ? static_cast<std::int16_t>(-1) : static_cast<std::int16_t>(0));
 		return true;
 	}
@@ -7149,6 +7222,12 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 		originalSegments.empty()) {
 		return false;
 	}
+	for (auto& segment : originalSegments) {
+		RepairMismatchedUnqualifiedLocalFunctionBindings(
+			segment.data,
+			segment.methodReferences,
+			encodeContext);
+	}
 
 	const std::vector<size_t> reuseMatches =
 		BuildReusableNativeLineMatches(currentReusableLines, originalSegments);
@@ -7521,6 +7600,12 @@ bool TryBuildMethodCodeDataWithRawStatementReuse(
 	if (!CollectOriginalRawStatementNativeSegments(originalStatements, nativeMethod, originalRawSegments) ||
 		originalRawSegments.empty()) {
 		return false;
+	}
+	for (auto& segment : originalRawSegments) {
+		RepairMismatchedUnqualifiedLocalFunctionBindings(
+			segment.data,
+			segment.methodReferences,
+			encodeContext);
 	}
 
 	const std::vector<size_t> reuseMatches =
@@ -14412,7 +14497,14 @@ bool BuildRestoreModel(
 						continue;
 					}
 					const NativeFunctionSymbol sourceMethodSymbol{ -2, sourceMethodSnapshot.id };
-					nativeObjectEncodeContext.localFunctionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
+					nativeObjectEncodeContext.functionNamesById.insert_or_assign(
+						sourceMethodSnapshot.id,
+						sourceMethodKey);
+					if (sourceClassIndex == classIndex) {
+						nativeObjectEncodeContext.localFunctionsByName.insert_or_assign(
+							sourceMethodKey,
+							sourceMethodSymbol);
+					}
 					nativeObjectEncodeContext.functionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
 					nativeObjectEncodeContext
 						.methodsByOwnerType[sourceSnapshot->classId]
@@ -14428,6 +14520,9 @@ bool BuildRestoreModel(
 					.insert_or_assign(
 						TypeResolver::NormalizeTypeName(existingMethod.name),
 						NativeFunctionSymbol{ -2, existingMethod.id });
+				nativeObjectEncodeContext.functionNamesById.insert_or_assign(
+					existingMethod.id,
+					TypeResolver::NormalizeTypeName(existingMethod.name));
 				if (existingMethod.ownerClass == 0) {
 					continue;
 				}
@@ -14448,7 +14543,14 @@ bool BuildRestoreModel(
 						continue;
 					}
 					const NativeFunctionSymbol sourceMethodSymbol{ -2, sourceMethodId };
-					nativeObjectEncodeContext.localFunctionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
+					nativeObjectEncodeContext.functionNamesById.insert_or_assign(
+						sourceMethodId,
+						sourceMethodKey);
+					if (sourceClassIndex == classIndex) {
+						nativeObjectEncodeContext.localFunctionsByName.insert_or_assign(
+							sourceMethodKey,
+							sourceMethodSymbol);
+					}
 					nativeObjectEncodeContext.functionsByName.insert_or_assign(sourceMethodKey, sourceMethodSymbol);
 					nativeObjectEncodeContext
 						.methodsByOwnerType[sourceOwnerTypeId]
@@ -14493,32 +14595,24 @@ bool BuildRestoreModel(
 				method.variableReference = nativeMethodSnapshot->variableReference;
 				method.constantReference = nativeMethodSnapshot->constantReference;
 				method.expressionData = nativeMethodSnapshot->expressionData;
-				size_t normalizedBooleanCount = 0;
-				// Historical snapshots may contain valid opcodes that the public parser
-				// does not yet understand. Preserve those snapshots byte-for-byte; only
-				// normalize after the entire method body has been parsed successfully.
-				(void)e2txt::NormalizeNativeMethodBooleanLiterals(
-					method.expressionData,
-					normalizedBooleanCount,
-					nullptr);
+				std::vector<std::int32_t> copiedMethodReferences;
+				if (DecodeNativeLineOffsets(method.methodReference, copiedMethodReferences)) {
+					RepairMismatchedUnqualifiedLocalFunctionBindings(
+						method.expressionData,
+						copiedMethodReferences,
+						nativeObjectEncodeContext);
+				}
 			}
 			else if (identityNativeMethodSnapshot != nullptr) {
 				std::string semanticError;
 				std::string reusableLineError;
-				BundleNativeMethodSnapshot normalizedIdentityNativeMethodSnapshot =
-					*identityNativeMethodSnapshot;
-				size_t normalizedBooleanCount = 0;
-				(void)e2txt::NormalizeNativeMethodBooleanLiterals(
-					normalizedIdentityNativeMethodSnapshot.expressionData,
-					normalizedBooleanCount,
-					nullptr);
 				const bool rebuiltWithReusableNativeLines =
 					!changedClassKinds[classIndex] &&
 					originalParsedMethod != nullptr &&
 					TryBuildMethodCodeDataWithReusableNativeLineSegments(
 						parsedMethod.bodyLines,
 						originalParsedMethod->bodyLines,
-						normalizedIdentityNativeMethodSnapshot,
+						*identityNativeMethodSnapshot,
 						method,
 						nativeObjectEncodeContext,
 						invalidNativeReferenceIds,
