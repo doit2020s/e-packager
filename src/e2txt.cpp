@@ -30,6 +30,7 @@
 #include "BundlePathUtils.h"
 #include "NativeDependencyEvidencePolicy.h"
 #include "PathHelper.h"
+#include "ProgramPageHeaderPolicy.h"
 #include "SupportLibraryPublicInfo.h"
 
 namespace e2txt {
@@ -1173,39 +1174,6 @@ std::string BuildDefinitionLine(
 	for (size_t i = 0; i < count; ++i) {
 		if (i != 0) {
 			stream << ", ";
-		}
-		stream << rawItems[i];
-	}
-	return stream.str();
-}
-
-std::string BuildDefinitionLineWithMinimumFieldCount(
-	const std::string& type,
-	const std::vector<std::string>& rawItems,
-	const size_t minimumFieldCount,
-	int indent = 0)
-{
-	std::ostringstream stream;
-	for (int i = 0; i < indent; ++i) {
-		stream << "    ";
-	}
-	stream << "." << type;
-
-	size_t count = rawItems.size();
-	while (count > minimumFieldCount && rawItems[count - 1].empty()) {
-		--count;
-	}
-	if (count == 0) {
-		return stream.str();
-	}
-
-	stream << " ";
-	for (size_t i = 0; i < count; ++i) {
-		if (i != 0) {
-			stream << ",";
-			if (!rawItems[i].empty() || i + 1 < count) {
-				stream << " ";
-			}
 		}
 		stream << rawItems[i];
 	}
@@ -5915,7 +5883,10 @@ void BuildProgramPages(
 		AppendLine(page, "");
 
 		std::string baseClassName;
-		if (pageInfo.baseClass != 0 && pageInfo.baseClass != -1) {
+		if (pageInfo.baseClass == -1) {
+			baseClassName = std::string(kExplicitRootObjectClassName);
+		}
+		else if (pageInfo.baseClass != 0) {
 			baseClassName = TrimAsciiCopy(resolver.ResolveType(pageInfo.baseClass));
 		}
 		if (baseClassName == "窗口") {
@@ -5927,9 +5898,7 @@ void BuildProgramPages(
 			IsProgramPagePublic(sections, pageInfo.header.dwId) ? "公开" : std::string(),
 			TrimAsciiCopy(pageInfo.comment),
 		};
-		AppendLine(page, pageInfo.baseClass == -1
-			? BuildDefinitionLineWithMinimumFieldCount("程序集", headerFields, 2)
-			: BuildDefinitionLine(
+		AppendLine(page, BuildDefinitionLine(
 			"程序集",
 			headerFields));
 
@@ -6698,10 +6667,13 @@ std::string JoinPageLines(const std::vector<std::string>& lines)
 std::string BuildProgramPageBaseClassName(const CodePageInfo& pageInfo, SymbolResolver& resolver)
 {
 	std::string baseClassName;
-	if (pageInfo.baseClass != 0 && pageInfo.baseClass != -1) {
+	if (pageInfo.baseClass == -1) {
+		baseClassName = std::string(kExplicitRootObjectClassName);
+	}
+	else if (pageInfo.baseClass != 0) {
 		baseClassName = TrimAsciiCopy(resolver.ResolveType(pageInfo.baseClass));
 	}
-	if (baseClassName == "窗口" || baseClassName == "对象" || baseClassName == "<对象>") {
+	if (baseClassName == "窗口") {
 		baseClassName.clear();
 	}
 	return baseClassName;
@@ -6960,7 +6932,7 @@ struct SnapshotMethodDef {
 struct SnapshotClassDef {
 	std::string name;
 	std::string baseClassName;
-	bool hasBaseClassField = false;
+	bool isUserClass = false;
 	bool isPublic = false;
 	std::string comment;
 	std::vector<SnapshotVariableDef> vars;
@@ -7205,7 +7177,7 @@ std::string ComputeSnapshotClassShapeDigest(const SnapshotClassDef& snapshot)
 {
 	std::ostringstream stream;
 	stream << "name=" << snapshot.name << "\n";
-	stream << "base=" << (snapshot.hasBaseClassField && snapshot.baseClassName.empty()
+	stream << "base=" << (snapshot.isUserClass && snapshot.baseClassName.empty()
 		? std::string("<对象>")
 		: snapshot.baseClassName) << "\n";
 	stream << "public=" << (snapshot.isPublic ? 1 : 0) << "\n";
@@ -7243,7 +7215,7 @@ bool TryBuildProgramPageSnapshot(const Page& page, SnapshotClassDef& outSnapshot
 	}
 	outSnapshot.name = GetSnapshotFieldOrEmpty(fields, 0);
 	outSnapshot.baseClassName = GetSnapshotFieldOrEmpty(fields, 1);
-	outSnapshot.hasBaseClassField = fields.size() > 1;
+	outSnapshot.isUserClass = IsUserClassProgramHeader(fields.size(), outSnapshot.baseClassName);
 	outSnapshot.isPublic = GetSnapshotFieldOrEmpty(fields, 2) == "公开";
 	if (fields.size() > 3) {
 		std::vector<std::string> remain(fields.begin() + 3, fields.end());

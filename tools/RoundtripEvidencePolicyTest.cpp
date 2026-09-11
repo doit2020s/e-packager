@@ -2,6 +2,7 @@
 #include "../src/NativeDependencyEvidencePolicy.h"
 #include "../src/NativeFormIdentityPolicy.h"
 #include "../src/NativeMethodIdentityPolicy.h"
+#include "../src/ProgramPageHeaderPolicy.h"
 #include <iostream>
 
 int main()
@@ -11,6 +12,13 @@ int main()
 		if (!condition) { std::cerr << label << '\n'; ++failures; }
 	};
 	using nlohmann::json;
+	check(e2txt::IsUserClassProgramHeader(2, ""),
+		"one trailing comma must remain the legacy no-parent class marker");
+	check(e2txt::IsUserClassProgramHeader(4, "<对象>"),
+		"an explicit root object must identify a no-parent user class");
+	check(!e2txt::IsUserClassProgramHeader(1, "") &&
+		!e2txt::IsUserClassProgramHeader(4, ""),
+		"an ordinary assembly, including an empty base slot before a comment, must remain static");
 	json first = {{"sourceMd5", "first"}, {"sourceSize", 10}, {"sourceFileKind", "e"}, {"version", 1}};
 	json second = {{"sourceMd5", "second"}, {"sourceSize", 20}, {"sourceFileKind", "e"}, {"version", 1}};
 	e2txt::NormalizeRoundtripSourceInfo(first, "info.json");

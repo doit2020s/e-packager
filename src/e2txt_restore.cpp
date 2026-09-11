@@ -30,6 +30,7 @@
 #include "NativeFormIdentityPolicy.h"
 #include "NativeMethodIdentityPolicy.h"
 #include "PathHelper.h"
+#include "ProgramPageHeaderPolicy.h"
 #include "SimpleXmlDocument.h"
 #include "SourceArrayFormatValidator.h"
 #include "SupportLibraryPublicInfo.h"
@@ -7918,7 +7919,6 @@ struct ParsedClassDef {
 	std::string name;
 	std::string sourcePath;
 	std::string baseClassName;
-	bool hasBaseClassField = false;
 	bool isPublic = false;
 	bool isFormClass = false;
 	bool isUserClass = false;
@@ -8581,7 +8581,7 @@ std::string ComputeParsedClassShapeDigest(const ParsedClassDef& parsedClass)
 {
 	std::ostringstream stream;
 	stream << "name=" << parsedClass.name << "\n";
-	stream << "base=" << (parsedClass.hasBaseClassField && parsedClass.baseClassName.empty()
+	stream << "base=" << (parsedClass.isUserClass && parsedClass.baseClassName.empty()
 		? std::string("<对象>")
 		: parsedClass.baseClassName) << "\n";
 	stream << "public=" << (parsedClass.isPublic ? 1 : 0) << "\n";
@@ -8798,7 +8798,6 @@ bool ParseProgramPage(const Page& page, const std::unordered_set<std::string>& f
 	outClass.sourcePath = page.sourcePath;
 	outClass.name = fields.size() > 0 ? fields[0] : page.name;
 	outClass.baseClassName = GetFieldOrEmpty(fields, 1);
-	outClass.hasBaseClassField = fields.size() > 1;
 	outClass.isPublic = GetFieldOrEmpty(fields, 2) == "公开";
 	outClass.comment = ExtractRemainingDefinitionFieldText(TrimAsciiCopy(page.lines[index]), "程序集", 3);
 	const std::string normalizedBaseClassName = TypeResolver::NormalizeTypeName(outClass.baseClassName);
@@ -8806,7 +8805,8 @@ bool ParseProgramPage(const Page& page, const std::unordered_set<std::string>& f
 		formNames.contains(outClass.name) ||
 		normalizedBaseClassName == "窗口" ||
 		IsLikelyFormClassName(outClass.name);
-	outClass.isUserClass = !outClass.isFormClass && (outClass.hasBaseClassField || !normalizedBaseClassName.empty());
+	outClass.isUserClass = !outClass.isFormClass &&
+		IsUserClassProgramHeader(fields.size(), normalizedBaseClassName);
 	++index;
 
 	while (index < page.lines.size()) {
@@ -13597,13 +13597,17 @@ bool BuildRestoreModel(
 		const ParsedClassDef* originalClass =
 			findOriginalParsedClassForSnapshot(trustedOriginalSnapshot);
 		if (nativeSourceSnapshot != nullptr) {
-			// The exporter can omit an empty base-class field from a native user class.
-			// Keep that proven native owner kind while the saved source header is
-			// unchanged, and rebuild only after an explicit header-kind edit.
+			// A trusted original snapshot may preserve the kind of an older ambiguous
+			// export. Supplemental snapshots for newly added pages may retain an owner
+			// only when its native kind agrees with the current explicit header policy.
 			bool originalKindChanged = false;
 			if (originalClass != nullptr) {
 				originalKindChanged = parsedClass.isFormClass != originalClass->isFormClass ||
 					parsedClass.isUserClass != originalClass->isUserClass;
+			}
+			else if (nativeSourceSnapshot->classId != 0) {
+				originalKindChanged = epl_system_id::GetType(nativeSourceSnapshot->classId) !=
+					GetParsedClassNativeKind(parsedClass);
 			}
 			changedClassKinds[classIndex] = originalKindChanged;
 

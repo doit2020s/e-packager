@@ -434,15 +434,26 @@ pieces ＝ 分割文本 (“a|b”, “|”, )
 返回 (#ProbeNativeConstant)
 '@
 Write-EText $kindSource $kindText
+Write-EText (Join-Path $kindWorkspace 'src\ProbeGroup\OrdinaryCommentProbe.txt') @'
+.版本 2
+
+.程序集 OrdinaryCommentProbe, , , ordinary assembly comment
+
+.子程序 OrdinaryValue, 整数型, 公开
+返回 (11)
+'@
 Write-EText (Join-Path $kindWorkspace 'src\TailProbe.txt') ".版本 2`r`n`r`n.程序集 TailProbe`r`n`r`n.子程序 TailValue, 整数型`r`n返回 (8)`r`n"
 Write-EText (Join-Path $kindWorkspace 'src\.常量.txt') ".版本 2`r`n`r`n.常量 ProbeNativeConstant, 9, 公开`r`n"
 $kindCandidate = Join-Path $OutputRoot 'kind-class.e'
 $kindProjection = Join-Path $OutputRoot 'kind-class-unpacked'
 Invoke-Packager @('pack', $kindWorkspace, $kindCandidate)
 Invoke-Packager @('unpack', $kindCandidate, $kindProjection, '--main-only')
-function Get-ProbeSnapshot([string]$root) {
+function Get-SnapshotByMethod([string]$root, [string]$methodName) {
     $snapshots = Get-Content -LiteralPath (Join-Path $root 'project\.native_source_map.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-    return @($snapshots | Where-Object { 'ProbeValue' -in $_.methods.name })[0]
+    return @($snapshots | Where-Object { $methodName -in $_.methods.name })[0]
+}
+function Get-ProbeSnapshot([string]$root) {
+    return Get-SnapshotByMethod $root 'ProbeValue'
 }
 function Assert-ProbeOrder([string]$root) {
     $snapshots = @(Get-Content -LiteralPath (Join-Path $root 'project\.native_source_map.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
@@ -454,6 +465,54 @@ $classSnapshot = Get-ProbeSnapshot $kindProjection
 Assert-ProbeOrder $kindProjection
 if (($classSnapshot.classId -band 0xFF000000) -ne 0x49000000) { throw 'class category missing' }
 if ($classSnapshot.methods[0].attr -ne 0x38) { throw 'new public class method attr is not canonical' }
+$ordinarySnapshot = Get-SnapshotByMethod $kindProjection 'OrdinaryValue'
+if (($ordinarySnapshot.classId -band 0xFF000000) -ne 0x09000000 -or $ordinarySnapshot.baseClass -ne 0) {
+    throw 'new ordinary assembly with an empty base slot and comment was reclassified as a user class'
+}
+$firstClassSource = Join-Path $kindProjection 'src\ProbeGroup\CategoryProbe.txt'
+$firstOrdinarySource = Join-Path $kindProjection 'src\ProbeGroup\OrdinaryCommentProbe.txt'
+$firstClassText = [IO.File]::ReadAllText($firstClassSource)
+$firstOrdinaryText = [IO.File]::ReadAllText($firstOrdinarySource)
+if (-not $firstClassText.Contains('.程序集 CategoryProbe, <对象>')) {
+    throw 'no-parent user class was not exported with an explicit reversible root-object marker'
+}
+if (-not $firstOrdinaryText.Contains('.程序集 OrdinaryCommentProbe, , , ordinary assembly comment')) {
+    throw 'ordinary assembly comment header was not preserved'
+}
+$kindSecondCandidate = Join-Path $OutputRoot 'kind-class-roundtrip.e'
+$kindSecondProjection = Join-Path $OutputRoot 'kind-class-roundtrip-unpacked'
+Invoke-Packager @('pack', $kindProjection, $kindSecondCandidate)
+Invoke-Packager @('unpack', $kindSecondCandidate, $kindSecondProjection, '--main-only')
+$secondClassSnapshot = Get-ProbeSnapshot $kindSecondProjection
+$secondOrdinarySnapshot = Get-SnapshotByMethod $kindSecondProjection 'OrdinaryValue'
+if (($secondClassSnapshot.classId -band 0xFF000000) -ne 0x49000000 -or $secondClassSnapshot.baseClass -ne -1) {
+    throw 'explicit no-parent user class marker was not stable across the second roundtrip'
+}
+if (($secondOrdinarySnapshot.classId -band 0xFF000000) -ne 0x09000000 -or $secondOrdinarySnapshot.baseClass -ne 0) {
+    throw 'ordinary assembly comment header was not stable across the second roundtrip'
+}
+$firstClassProjectionHash = (Get-FileHash -LiteralPath $firstClassSource -Algorithm SHA256).Hash
+$secondClassProjectionHash = (Get-FileHash -LiteralPath (Join-Path $kindSecondProjection 'src\ProbeGroup\CategoryProbe.txt') -Algorithm SHA256).Hash
+$firstOrdinaryProjectionHash = (Get-FileHash -LiteralPath $firstOrdinarySource -Algorithm SHA256).Hash
+$secondOrdinaryProjectionHash = (Get-FileHash -LiteralPath (Join-Path $kindSecondProjection 'src\ProbeGroup\OrdinaryCommentProbe.txt') -Algorithm SHA256).Hash
+if ($firstClassProjectionHash -ne $secondClassProjectionHash -or
+    $firstOrdinaryProjectionHash -ne $secondOrdinaryProjectionHash) {
+    throw 'class/ordinary header text projection is not stable across the second roundtrip'
+}
+$untrustedKindMapPath = Join-Path $kindSecondProjection 'project\.native_source_map.json'
+$untrustedKindMap = @(Get-Content -LiteralPath $untrustedKindMapPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+$untrustedOrdinarySnapshot = @($untrustedKindMap | Where-Object { 'OrdinaryValue' -in $_.methods.name })[0]
+$untrustedOrdinarySnapshot.classId = 0x4907F1A2
+$untrustedOrdinarySnapshot.baseClass = -1
+Write-EText $untrustedKindMapPath (($untrustedKindMap | ConvertTo-Json -Depth 20) + "`r`n")
+$untrustedKindCandidate = Join-Path $OutputRoot 'kind-untrusted-snapshot.e'
+$untrustedKindProjection = Join-Path $OutputRoot 'kind-untrusted-snapshot-unpacked'
+Invoke-Packager @('pack', $kindSecondProjection, $untrustedKindCandidate)
+Invoke-Packager @('unpack', $untrustedKindCandidate, $untrustedKindProjection, '--main-only')
+$repairedOrdinarySnapshot = Get-SnapshotByMethod $untrustedKindProjection 'OrdinaryValue'
+if (($repairedOrdinarySnapshot.classId -band 0xFF000000) -ne 0x09000000 -or $repairedOrdinarySnapshot.baseClass -ne 0) {
+    throw 'untrusted supplemental class metadata overrode a newly added ordinary assembly header'
+}
 $kindNativeMapPath = Join-Path $kindProjection 'project\.native_source_map.json'
 $kindNativeMap = @(Get-Content -LiteralPath $kindNativeMapPath -Raw -Encoding UTF8 | ConvertFrom-Json)
 $kindNativeProbe = @($kindNativeMap | Where-Object { 'ProbeValue' -in $_.methods.name })[0]
@@ -1798,6 +1857,16 @@ $result = [ordered]@{
     cross_form_control_owner_type = ('0x{0:X8}' -f $iextControlTypeId)
     cross_form_control_projection_sha256 = (Get-FileHash -LiteralPath $crossControlSource1 -Algorithm SHA256).Hash.ToLowerInvariant()
     cross_form_control_second_projection_sha256 = (Get-FileHash -LiteralPath $crossControlSource2 -Algorithm SHA256).Hash.ToLowerInvariant()
+	header_kind_user_class_id = ('0x{0:X8}' -f $classSnapshot.classId)
+	header_kind_user_class_base = $classSnapshot.baseClass
+	header_kind_ordinary_id = ('0x{0:X8}' -f $ordinarySnapshot.classId)
+	header_kind_ordinary_base = $ordinarySnapshot.baseClass
+	header_kind_class_projection_sha256 = $firstClassProjectionHash.ToLowerInvariant()
+	header_kind_class_second_projection_sha256 = $secondClassProjectionHash.ToLowerInvariant()
+	header_kind_ordinary_projection_sha256 = $firstOrdinaryProjectionHash.ToLowerInvariant()
+	header_kind_ordinary_second_projection_sha256 = $secondOrdinaryProjectionHash.ToLowerInvariant()
+	header_kind_roundtrip_stable = $true
+	header_kind_untrusted_snapshot_repaired = $true
 	same_name_function_ids = $sharedBindingIds[0]
 	stale_same_name_snapshot_repaired = $true
 	semantic_true_encoding = '0xFFFF'

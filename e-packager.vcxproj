@@ -194,6 +194,7 @@
     <ClInclude Include="src\WorkspaceProjectSupport.h" />
     <ClInclude Include="src\e2txt.h" />
     <ClInclude Include="src\PathHelper.h" />
+    <ClInclude Include="src\ProgramPageHeaderPolicy.h" />
     <ClInclude Include="src\resource.h" />
     <ClInclude Include="src\SupportLibraryPublicInfo.h" />
     <ClInclude Include="elib\lib2.h" />
