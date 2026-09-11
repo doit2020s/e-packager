@@ -467,6 +467,34 @@ json NativeConstantSnapshotToJson(const BundleNativeConstantSnapshot& snapshot)
 	};
 }
 
+json NativeFormSnapshotToJson(const BundleNativeFormSnapshot& snapshot)
+{
+	json elements = json::array();
+	for (const auto& element : snapshot.elements) {
+		json events = json::array();
+		for (const auto& [eventKey, handlerId] : element.events) {
+			events.push_back(json{
+				{ "eventKey", eventKey },
+				{ "handlerId", handlerId },
+			});
+		}
+		elements.push_back(json{
+			{ "name", LocalToUtf8Text(element.name) },
+			{ "id", element.id },
+			{ "dataType", element.dataType },
+			{ "isMenu", element.isMenu },
+			{ "isFormSelf", element.isFormSelf },
+			{ "events", std::move(events) },
+			{ "clickEvent", element.clickEvent },
+		});
+	}
+	return json{
+		{ "name", LocalToUtf8Text(snapshot.name) },
+		{ "id", snapshot.id },
+		{ "elements", std::move(elements) },
+	};
+}
+
 json NativeSourceSnapshotToJson(const BundleNativeSourceFileSnapshot& snapshot)
 {
 	json methods = json::array();
@@ -682,6 +710,36 @@ BundleNativeConstantSnapshot NativeConstantSnapshotFromJson(const json& item)
 	snapshot.textDigest = item.value("textDigest", "");
 	snapshot.id = item.value("id", 0);
 	snapshot.pageType = item.value("pageType", 0);
+	return snapshot;
+}
+
+BundleNativeFormSnapshot NativeFormSnapshotFromJson(const json& item)
+{
+	BundleNativeFormSnapshot snapshot;
+	snapshot.name = Utf8ToLocalText(item.value("name", ""));
+	snapshot.id = item.value("id", 0);
+	if (const auto it = item.find("elements"); it != item.end() && it->is_array()) {
+		for (const auto& value : *it) {
+			BundleNativeFormElementSnapshot element;
+			element.name = Utf8ToLocalText(value.value("name", ""));
+			element.id = value.value("id", 0);
+			element.dataType = value.value("dataType", 0);
+			element.isMenu = value.value("isMenu", false);
+			element.isFormSelf = value.value("isFormSelf", false);
+			if (const auto eventIt = value.find("events"); eventIt != value.end() && eventIt->is_array()) {
+				for (const auto& eventValue : *eventIt) {
+					if (!eventValue.is_object()) {
+						continue;
+					}
+					element.events.emplace_back(
+						eventValue.value("eventKey", -1),
+						eventValue.value("handlerId", 0));
+				}
+			}
+			element.clickEvent = value.value("clickEvent", 0);
+			snapshot.elements.push_back(std::move(element));
+		}
+	}
 	return snapshot;
 }
 
@@ -1379,6 +1437,7 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 	persistedBundle.nativeStructSnapshots = bundle.nativeStructSnapshots;
 	persistedBundle.nativeDllSnapshots = bundle.nativeDllSnapshots;
 	persistedBundle.nativeConstantSnapshots = bundle.nativeConstantSnapshots;
+	persistedBundle.nativeFormSnapshots = bundle.nativeFormSnapshots;
 
 	for (auto file : bundle.sourceFiles) {
 		const std::string desiredRelativePath = NormalizeSourceRelativePathForWrite(file);
@@ -1450,7 +1509,8 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 	if (!bundle.nativeGlobalSnapshots.empty() ||
 		!bundle.nativeStructSnapshots.empty() ||
 		!bundle.nativeDllSnapshots.empty() ||
-		!bundle.nativeConstantSnapshots.empty()) {
+		!bundle.nativeConstantSnapshots.empty() ||
+		!bundle.nativeFormSnapshots.empty()) {
 		json nativeSymbolMap;
 		if (bundle.nativeProgramHeader.has_value()) {
 			nativeSymbolMap["programHeader"] = NativeProgramHeaderSnapshotToJson(*bundle.nativeProgramHeader);
@@ -1459,6 +1519,7 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 		nativeSymbolMap["structs"] = json::array();
 		nativeSymbolMap["dlls"] = json::array();
 		nativeSymbolMap["constants"] = json::array();
+		nativeSymbolMap["forms"] = json::array();
 		for (const auto& snapshot : bundle.nativeGlobalSnapshots) {
 			nativeSymbolMap["globals"].push_back(NativeGlobalSnapshotToJson(snapshot));
 		}
@@ -1470,6 +1531,9 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 		}
 		for (const auto& snapshot : bundle.nativeConstantSnapshots) {
 			nativeSymbolMap["constants"].push_back(NativeConstantSnapshotToJson(snapshot));
+		}
+		for (const auto& snapshot : bundle.nativeFormSnapshots) {
+			nativeSymbolMap["forms"].push_back(NativeFormSnapshotToJson(snapshot));
 		}
 		if (!WriteUtf8TextFileBom(GetNativeSymbolMapPath(root), NormalizeCrLf(DumpJson(nativeSymbolMap)))) {
 			if (outError != nullptr) {
@@ -1512,7 +1576,16 @@ bool BundleDirectoryCodec::WriteBundle(const ProjectBundle& bundle, const std::s
 		persistedBundle.resources.push_back(resource);
 	}
 
-	metaJson["nativeBundleDigest"] = LocalToUtf8Text(ComputeBundleDigest(persistedBundle));
+	std::string persistedNativeBundleDigest = ComputeBundleDigest(persistedBundle);
+	if (!bundle.nativeSourceBytes.empty() &&
+		!bundle.nativeBundleDigest.empty() &&
+		bundle.nativeBundleDigest != ComputeBundleDigest(bundle)) {
+		// Keep the digest that describes the preserved native bytes when editable
+		// workspace content has changed. Recomputing it here would incorrectly mark
+		// stale bytes as an exact snapshot and bypass semantic rebuilding on pack.
+		persistedNativeBundleDigest = bundle.nativeBundleDigest;
+	}
+	metaJson["nativeBundleDigest"] = LocalToUtf8Text(persistedNativeBundleDigest);
 
 	if (!WriteUtf8TextFileBom(GetMetaJsonPath(root), NormalizeCrLf(DumpJson(metaJson)))) {
 		if (outError != nullptr) {
@@ -1699,6 +1772,11 @@ bool BundleDirectoryCodec::ReadBundle(const std::string& inputDir, ProjectBundle
 		if (const auto it = nativeSymbolMapJson.find("constants"); it != nativeSymbolMapJson.end() && it->is_array()) {
 			for (const auto& item : *it) {
 				bundle.nativeConstantSnapshots.push_back(NativeConstantSnapshotFromJson(item));
+			}
+		}
+		if (const auto it = nativeSymbolMapJson.find("forms"); it != nativeSymbolMapJson.end() && it->is_array()) {
+			for (const auto& item : *it) {
+				bundle.nativeFormSnapshots.push_back(NativeFormSnapshotFromJson(item));
 			}
 		}
 	}

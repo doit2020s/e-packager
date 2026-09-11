@@ -28,6 +28,7 @@
 #include <lib2.h>
 
 #include "BundlePathUtils.h"
+#include "NativeDependencyEvidencePolicy.h"
 #include "PathHelper.h"
 #include "SupportLibraryPublicInfo.h"
 
@@ -877,6 +878,7 @@ struct EComDependencyRecord {
 	std::string name;
 	std::string path;
 	bool reExport = false;
+	bool hasInvalidDefinedIdRange = false;
 	std::vector<DefinedIdRange> definedIds;
 };
 
@@ -2690,6 +2692,7 @@ bool ParseEComDependencies(const std::vector<std::uint8_t>& bytes, std::vector<E
 		record.definedIds.reserve(starts.size());
 		for (size_t rangeIndex = 0; rangeIndex < starts.size(); ++rangeIndex) {
 			if (counts[rangeIndex] <= 0) {
+				record.hasInvalidDefinedIdRange = true;
 				continue;
 			}
 			record.definedIds.push_back(EComDependencyRecord::DefinedIdRange {
@@ -7496,6 +7499,31 @@ bool BuildBundleFromSections(
 		file.xmlText = JoinPageLines(formXml.lines);
 		bundle.formFiles.push_back(std::move(file));
 
+		BundleNativeFormSnapshot formSnapshot;
+		formSnapshot.name = TrimAsciiCopy(resolver.ResolveUserName(form.header.dwId));
+		formSnapshot.id = form.header.dwId;
+		const FormInfo::ElementInfo* formSelf = FindFormSelfElement(form);
+		formSnapshot.elements.reserve(form.elements.size());
+		for (const auto& element : form.elements) {
+			BundleNativeFormElementSnapshot elementSnapshot;
+			elementSnapshot.name = TrimAsciiCopy(element.name);
+			elementSnapshot.id = element.id;
+			elementSnapshot.dataType = element.dataType;
+			elementSnapshot.isMenu = element.isMenu;
+			elementSnapshot.isFormSelf = &element == formSelf;
+			elementSnapshot.events = element.events;
+			elementSnapshot.clickEvent = element.clickEvent;
+			if (elementSnapshot.id != 0 && epl_system_id::GetType(elementSnapshot.id) == 0) {
+				elementSnapshot.id |= elementSnapshot.isFormSelf
+					? epl_system_id::kTypeFormSelf
+					: (elementSnapshot.isMenu
+						? epl_system_id::kTypeFormMenu
+						: epl_system_id::kTypeFormControl);
+			}
+			formSnapshot.elements.push_back(std::move(elementSnapshot));
+		}
+		bundle.nativeFormSnapshots.push_back(std::move(formSnapshot));
+
 		const auto classKeyIt = itemKeys.find(form.unknown2);
 		if (classKeyIt != itemKeys.end()) {
 			WindowBinding binding;
@@ -7808,9 +7836,13 @@ bool CaptureNativeSectionSnapshots(
 bool ExtractNativeDependencySymbols(
 	const std::vector<std::uint8_t>& inputBytes,
 	std::vector<NativeDependencySymbolRecord>& outRecords,
-	std::string* outError)
+	std::string* outError,
+	NativeUnassignedDependencySymbols* outUnassigned)
 {
 	outRecords.clear();
+	if (outUnassigned != nullptr) {
+		*outUnassigned = {};
+	}
 	if (outError != nullptr) {
 		outError->clear();
 	}
@@ -7832,7 +7864,10 @@ bool ExtractNativeDependencySymbols(
 	}
 
 	outRecords.reserve(dependencyRecords.size());
+	std::vector<NativeDependencyRangeEvidence> rangeEvidence;
+	bool hasInvalidDefinedIdRange = false;
 	for (const auto& record : dependencyRecords) {
+		hasInvalidDefinedIdRange = hasInvalidDefinedIdRange || record.hasInvalidDefinedIdRange;
 		NativeDependencySymbolRecord item;
 		item.name = record.name;
 		item.path = record.path;
@@ -7844,30 +7879,49 @@ bool ExtractNativeDependencySymbols(
 					range.start,
 					range.count,
 				});
+				rangeEvidence.push_back(NativeDependencyRangeEvidence{
+					range.start,
+					range.count,
+					outRecords.size(),
+				});
 			}
 		}
 		outRecords.push_back(std::move(item));
+	}
+	const auto normalizeRangeType = [](const std::int32_t id) {
+		const std::int32_t type = epl_system_id::GetType(id);
+		if (type == epl_system_id::kTypeClass ||
+			type == epl_system_id::kTypeStaticClass ||
+			type == epl_system_id::kTypeFormClass) {
+			return epl_system_id::kTypeClass;
+		}
+		return type;
+	};
+	if (hasInvalidDefinedIdRange ||
+		!ValidateNativeDependencyRanges(rangeEvidence, normalizeRangeType)) {
+		outRecords.clear();
+		if (outUnassigned != nullptr) {
+			*outUnassigned = {};
+		}
+		if (outError != nullptr) {
+			*outError = "invalid_ecom_defined_id_ranges";
+		}
+		return false;
 	}
 
 	const auto findRecordIndexById = [&](const std::int32_t id) -> size_t {
 		if ((id & epl_system_id::kMaskType) == 0) {
 			return dependencyRecords.size();
 		}
-		const auto isClassLikeType = [](const std::int32_t type) {
-			return type == epl_system_id::kTypeClass ||
-				type == epl_system_id::kTypeStaticClass ||
-				type == epl_system_id::kTypeFormClass;
-		};
 		const std::int32_t idNum = id & epl_system_id::kMaskNum;
-		const std::int32_t idType = epl_system_id::GetType(id);
+		const std::int32_t idType = normalizeRangeType(id);
 		for (size_t recordIndex = 0; recordIndex < dependencyRecords.size(); ++recordIndex) {
 			for (const auto& range : dependencyRecords[recordIndex].definedIds) {
 				if (range.count <= 0) {
 					continue;
 				}
-				const std::int32_t rangeType = epl_system_id::GetType(range.start);
-				if (rangeType != idType &&
-					!(rangeType == epl_system_id::kTypeClass && isClassLikeType(idType))) {
+				const std::int32_t rangeType = normalizeRangeType(range.start);
+				if (rangeType != idType) {
 					continue;
 				}
 				const std::int32_t startNum = range.start & epl_system_id::kMaskNum;
@@ -7888,41 +7942,55 @@ bool ExtractNativeDependencySymbols(
 	for (const auto& page : sections.program.codePages) {
 		classNamesById.insert_or_assign(page.header.dwId, TrimAsciiCopy(resolver.ResolveUserName(page.header.dwId)));
 		const size_t recordIndex = findRecordIndexById(page.header.dwId);
-		if (recordIndex >= outRecords.size()) {
-			continue;
-		}
-
 		NativeDependencyClassSymbol classSymbol;
 		classSymbol.id = page.header.dwId;
 		classSymbol.memoryAddress = page.header.dwUnk;
 		classSymbol.baseClass = page.baseClass;
 		classSymbol.name = classNamesById[page.header.dwId];
-		outRecords[recordIndex].classes.push_back(std::move(classSymbol));
+		if (recordIndex < outRecords.size()) {
+			outRecords[recordIndex].classes.push_back(std::move(classSymbol));
+		}
+		else if (outUnassigned != nullptr &&
+			CanCollectUnassignedNativeDependencySymbol(NativeUnassignedSymbolKind::Class)) {
+			outUnassigned->classes.push_back(std::move(classSymbol));
+		}
 	}
 
 	for (const auto& dataType : sections.program.dataTypes) {
 		const size_t recordIndex = findRecordIndexById(dataType.header.dwId);
-		if (recordIndex >= outRecords.size()) {
-			continue;
-		}
-
 		NativeDependencyStructSymbol structSymbol;
 		structSymbol.id = dataType.header.dwId;
 		structSymbol.memoryAddress = dataType.header.dwUnk;
-		structSymbol.name = TrimAsciiCopy(resolver.ResolveUserName(dataType.header.dwId));
+		structSymbol.name = TrimAsciiCopy(dataType.name);
+		if (structSymbol.name.empty()) {
+			structSymbol.name = TrimAsciiCopy(resolver.ResolveUserName(dataType.header.dwId));
+		}
 		structSymbol.memberIds.reserve(dataType.members.size());
+		structSymbol.members.reserve(dataType.members.size());
 		for (const auto& member : dataType.members) {
 			structSymbol.memberIds.push_back(member.marker);
+			NativeDependencyStructMemberSymbol memberSymbol;
+			memberSymbol.id = member.marker;
+			memberSymbol.dataType = member.dataType;
+			memberSymbol.attr = member.attr;
+			memberSymbol.name = TrimAsciiCopy(member.name);
+			if (memberSymbol.name.empty()) {
+				memberSymbol.name = TrimAsciiCopy(resolver.ResolveUserName(member.marker));
+			}
+			memberSymbol.arrayBounds = member.arrayBounds;
+			structSymbol.members.push_back(std::move(memberSymbol));
 		}
-		outRecords[recordIndex].structs.push_back(std::move(structSymbol));
+		if (recordIndex < outRecords.size()) {
+			outRecords[recordIndex].structs.push_back(std::move(structSymbol));
+		}
+		else if (outUnassigned != nullptr &&
+			CanCollectUnassignedNativeDependencySymbol(NativeUnassignedSymbolKind::Struct)) {
+			outUnassigned->structs.push_back(std::move(structSymbol));
+		}
 	}
 
 	for (const auto& function : sections.program.functions) {
 		const size_t recordIndex = findRecordIndexById(function.header.dwId);
-		if (recordIndex >= outRecords.size()) {
-			continue;
-		}
-
 		NativeDependencyMethodSymbol methodSymbol;
 		methodSymbol.id = function.header.dwId;
 		methodSymbol.ownerClassId = function.ownerClass;
@@ -7950,14 +8018,17 @@ bool ExtractNativeDependencySymbols(
 		methodSymbol.variableReference = function.variableReference;
 		methodSymbol.constantReference = function.constantReference;
 		methodSymbol.expressionData = function.expressionData;
-		outRecords[recordIndex].methods.push_back(std::move(methodSymbol));
+		if (recordIndex < outRecords.size()) {
+			outRecords[recordIndex].methods.push_back(std::move(methodSymbol));
+		}
+		else if (outUnassigned != nullptr &&
+			CanCollectUnassignedNativeDependencySymbol(NativeUnassignedSymbolKind::Method)) {
+			outUnassigned->methods.push_back(std::move(methodSymbol));
+		}
 	}
 
 	for (const auto& constant : sections.resources.constants) {
 		const size_t recordIndex = findRecordIndexById(constant.marker);
-		if (recordIndex >= outRecords.size()) {
-			continue;
-		}
 		const std::string name = TrimAsciiCopy(resolver.ResolveUserName(constant.marker));
 		if (name.empty()) {
 			continue;
@@ -7965,15 +8036,13 @@ bool ExtractNativeDependencySymbols(
 		NativeDependencyConstantSymbol constantSymbol;
 		constantSymbol.id = constant.marker;
 		constantSymbol.name = name;
-		outRecords[recordIndex].constants.push_back(std::move(constantSymbol));
+		if (recordIndex < outRecords.size()) {
+			outRecords[recordIndex].constants.push_back(std::move(constantSymbol));
+		}
 	}
 
 	for (const auto& removedItem : sections.losable.removedDefinedItems) {
 		const size_t recordIndex = findRecordIndexById(removedItem.id);
-		if (recordIndex >= outRecords.size()) {
-			continue;
-		}
-
 		const std::string name = TrimAsciiCopy(removedItem.name);
 		if (name.empty()) {
 			continue;
@@ -7983,53 +8052,69 @@ bool ExtractNativeDependencySymbols(
 		if (idType == epl_system_id::kTypeClass ||
 			idType == epl_system_id::kTypeStaticClass ||
 			idType == epl_system_id::kTypeFormClass) {
+			if (recordIndex >= outRecords.size()) {
+				continue;
+			}
+			auto& symbols = outRecords[recordIndex].classes;
 			const bool exists = std::any_of(
-				outRecords[recordIndex].classes.begin(),
-				outRecords[recordIndex].classes.end(),
+				symbols.begin(),
+				symbols.end(),
 				[&](const NativeDependencyClassSymbol& item) { return item.id == removedItem.id; });
 			if (!exists) {
 				NativeDependencyClassSymbol classSymbol;
 				classSymbol.id = removedItem.id;
 				classSymbol.name = name;
-				outRecords[recordIndex].classes.push_back(std::move(classSymbol));
+				symbols.push_back(std::move(classSymbol));
 			}
 		}
 		else if (idType == epl_system_id::kTypeStruct) {
+			if (recordIndex >= outRecords.size()) {
+				continue;
+			}
+			auto& symbols = outRecords[recordIndex].structs;
 			const bool exists = std::any_of(
-				outRecords[recordIndex].structs.begin(),
-				outRecords[recordIndex].structs.end(),
+				symbols.begin(),
+				symbols.end(),
 				[&](const NativeDependencyStructSymbol& item) { return item.id == removedItem.id; });
 			if (!exists) {
 				NativeDependencyStructSymbol structSymbol;
 				structSymbol.id = removedItem.id;
 				structSymbol.name = name;
-				outRecords[recordIndex].structs.push_back(std::move(structSymbol));
+				symbols.push_back(std::move(structSymbol));
 			}
 		}
 		else if (idType == epl_system_id::kTypeMethod) {
+			if (recordIndex >= outRecords.size()) {
+				continue;
+			}
+			auto& symbols = outRecords[recordIndex].methods;
 			const bool exists = std::any_of(
-				outRecords[recordIndex].methods.begin(),
-				outRecords[recordIndex].methods.end(),
+				symbols.begin(),
+				symbols.end(),
 				[&](const NativeDependencyMethodSymbol& item) { return item.id == removedItem.id; });
 			if (!exists) {
 				NativeDependencyMethodSymbol methodSymbol;
 				methodSymbol.id = removedItem.id;
 				methodSymbol.name = name;
-				outRecords[recordIndex].methods.push_back(std::move(methodSymbol));
+				symbols.push_back(std::move(methodSymbol));
 			}
 		}
 		else if (idType == epl_system_id::kTypeConstant ||
 			idType == epl_system_id::kTypeImageResource ||
 			idType == epl_system_id::kTypeSoundResource) {
+			if (recordIndex >= outRecords.size()) {
+				continue;
+			}
+			auto& symbols = outRecords[recordIndex].constants;
 			const bool exists = std::any_of(
-				outRecords[recordIndex].constants.begin(),
-				outRecords[recordIndex].constants.end(),
+				symbols.begin(),
+				symbols.end(),
 				[&](const NativeDependencyConstantSymbol& item) { return item.id == removedItem.id; });
 			if (!exists) {
 				NativeDependencyConstantSymbol constantSymbol;
 				constantSymbol.id = removedItem.id;
 				constantSymbol.name = name;
-				outRecords[recordIndex].constants.push_back(std::move(constantSymbol));
+				symbols.push_back(std::move(constantSymbol));
 			}
 		}
 	}

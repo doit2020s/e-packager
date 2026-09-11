@@ -144,11 +144,20 @@ struct NativeDependencyConstantSymbol {
 };
 
 // 原生工程里易模块导入的公开数据类型符号。
+struct NativeDependencyStructMemberSymbol {
+	std::int32_t id = 0;
+	std::int32_t dataType = 0;
+	std::int16_t attr = 0;
+	std::string name;
+	std::vector<std::int32_t> arrayBounds;
+};
+
 struct NativeDependencyStructSymbol {
 	std::int32_t id = 0;
 	std::int32_t memoryAddress = 0;
 	std::string name;
 	std::vector<std::int32_t> memberIds;
+	std::vector<NativeDependencyStructMemberSymbol> members;
 };
 
 // 原生工程里单个易模块依赖的导入符号表。
@@ -161,6 +170,14 @@ struct NativeDependencySymbolRecord {
 	std::vector<NativeDependencyStructSymbol> structs;
 	std::vector<NativeDependencyMethodSymbol> methods;
 	std::vector<NativeDependencyConstantSymbol> constants;
+};
+
+// 原生工程中未被不完整 definedIds 范围归属的导入候选符号。
+// 调用方只能结合目标易模块的公开声明做唯一匹配后使用。
+struct NativeUnassignedDependencySymbols {
+	std::vector<NativeDependencyClassSymbol> classes;
+	std::vector<NativeDependencyStructSymbol> structs;
+	std::vector<NativeDependencyMethodSymbol> methods;
 };
 
 // 目录化资源类型。
@@ -312,6 +329,25 @@ struct BundleNativeConstantSnapshot {
 	std::int32_t pageType = 0;
 };
 
+// Native form-element identity used when method text is rebuilt while the
+// form XML remains unchanged. E projects can retain sparse control ids that
+// cannot be derived from XML order alone.
+struct BundleNativeFormElementSnapshot {
+	std::string name;
+	std::int32_t id = 0;
+	std::int32_t dataType = 0;
+	bool isMenu = false;
+	bool isFormSelf = false;
+	std::vector<std::pair<std::int32_t, std::int32_t>> events;
+	std::int32_t clickEvent = 0;
+};
+
+struct BundleNativeFormSnapshot {
+	std::string name;
+	std::int32_t id = 0;
+	std::vector<BundleNativeFormElementSnapshot> elements;
+};
+
 // 原生段快照。
 struct NativeSectionSnapshot {
 	std::uint32_t key = 0;
@@ -362,6 +398,7 @@ struct ProjectBundle {
 	std::vector<BundleNativeStructSnapshot> nativeStructSnapshots;
 	std::vector<BundleNativeDllSnapshot> nativeDllSnapshots;
 	std::vector<BundleNativeConstantSnapshot> nativeConstantSnapshots;
+	std::vector<BundleNativeFormSnapshot> nativeFormSnapshots;
 	std::string nativeBundleDigest;
 	std::vector<std::uint8_t> nativeSourceBytes;
 	// `.ec` 导出目录使用的公开接口头文本。
@@ -387,7 +424,8 @@ bool CaptureNativeSectionSnapshots(
 bool ExtractNativeDependencySymbols(
 	const std::vector<std::uint8_t>& inputBytes,
 	std::vector<NativeDependencySymbolRecord>& outRecords,
-	std::string* outError);
+	std::string* outError,
+	NativeUnassignedDependencySymbols* outUnassigned = nullptr);
 // 校验单个原生方法体字节码是否可被读侧解析器完整解析。
 bool ValidateNativeMethodBodyBytes(
 	const std::vector<std::uint8_t>& expressionData,

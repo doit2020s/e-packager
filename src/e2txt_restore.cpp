@@ -26,6 +26,7 @@
 #include "..\thirdparty\json.hpp"
 
 #include "EFolderCodec.h"
+#include "NativeDependencyEvidencePolicy.h"
 #include "PathHelper.h"
 #include "SimpleXmlDocument.h"
 #include "SourceArrayFormatValidator.h"
@@ -102,6 +103,11 @@ struct RestoreDependencyInfo {
 	std::vector<NativeDependencyStructSymbol> nativeStructs;
 	std::vector<NativeDependencyMethodSymbol> nativeMethods;
 	std::vector<NativeDependencyConstantSymbol> nativeConstants;
+	bool hasTrustedNativeDefinedIds = false;
+	bool hasTrustedNativeRecord = false;
+	std::string trustedEditablePath;
+	std::string trustedNativeName;
+	std::string trustedNativePath;
 	std::int32_t childIdStart = 0;
 	std::int32_t childIdEnd = 0;
 };
@@ -1492,6 +1498,7 @@ struct OriginalEComDependencyRecord {
 	std::string name;
 	std::string path;
 	bool reExport = false;
+	bool hasInvalidDefinedIdRange = false;
 	std::vector<RestoreDependencyInfo::DefinedIdRange> definedIds;
 };
 
@@ -1542,6 +1549,7 @@ bool ParseEComDependencySectionBytes(
 		record.definedIds.reserve(starts.size());
 		for (size_t rangeIndex = 0; rangeIndex < starts.size(); ++rangeIndex) {
 			if (counts[rangeIndex] <= 0) {
+				record.hasInvalidDefinedIdRange = true;
 				continue;
 			}
 			record.definedIds.push_back(RestoreDependencyInfo::DefinedIdRange{
@@ -1564,66 +1572,177 @@ std::string NormalizeDependencyMatchText(std::string text)
 	return text;
 }
 
-void ApplyNativeDependencyDefinedIds(
-	const ProjectBundle& bundle,
-	std::vector<RestoreDependencyInfo>& dependencies)
+std::string CanonicalizeDependencyMatchPath(
+	const std::string& rawPath,
+	const std::string& baseSourcePath,
+	const bool baseIsDirectory = false)
 {
+	if (rawPath.empty()) {
+		return {};
+	}
+	std::filesystem::path candidate = Utf8PathToPath(rawPath);
+	if (candidate.is_relative() && !baseSourcePath.empty()) {
+		std::filesystem::path base = Utf8PathToPath(baseSourcePath);
+		if (!baseIsDirectory) {
+			base = base.parent_path();
+		}
+		candidate = base / candidate;
+	}
+	std::error_code ec;
+	if (candidate.is_relative()) {
+		const auto absolute = std::filesystem::absolute(candidate, ec);
+		if (!ec) {
+			candidate = absolute;
+		}
+	}
+	ec.clear();
+	const auto canonical = std::filesystem::weakly_canonical(candidate, ec);
+	if (!ec) {
+		candidate = canonical;
+	}
+	else {
+		candidate = candidate.lexically_normal();
+	}
+	return NormalizeDependencyMatchText(PathToUtf8(candidate));
+}
+
+std::int32_t NormalizeDependencyRangeType(const std::int32_t id)
+{
+	const std::int32_t type = epl_system_id::GetType(id);
+	if (type == epl_system_id::kTypeClass ||
+		type == epl_system_id::kTypeStaticClass ||
+		type == epl_system_id::kTypeFormClass) {
+		return epl_system_id::kTypeClass;
+	}
+	return type;
+}
+
+template <typename Record>
+std::vector<size_t> MatchNativeDependencyRecordIndices(
+	const std::vector<RestoreDependencyInfo>& dependencies,
+	const std::vector<Record>& records,
+	const std::string& sourcePath)
+{
+	const size_t missing = (std::numeric_limits<size_t>::max)();
+	std::vector<size_t> result(dependencies.size(), missing);
+	std::vector<size_t> dependencyIndices;
+	std::vector<NativeDependencyMatchKey> dependencyKeys;
+	for (size_t dependencyIndex = 0; dependencyIndex < dependencies.size(); ++dependencyIndex) {
+		const auto& dependency = dependencies[dependencyIndex];
+		if (dependency.isSupportLibrary) {
+			continue;
+		}
+		dependencyIndices.push_back(dependencyIndex);
+		dependencyKeys.push_back(NativeDependencyMatchKey{
+			NormalizeDependencyMatchText(dependency.name),
+			CanonicalizeDependencyMatchPath(
+				dependency.resolvedPath.empty() ? dependency.path : dependency.resolvedPath,
+				sourcePath),
+		});
+	}
+	std::vector<NativeDependencyMatchKey> recordKeys;
+	recordKeys.reserve(records.size());
+	for (const auto& record : records) {
+		recordKeys.push_back(NativeDependencyMatchKey{
+			NormalizeDependencyMatchText(record.name),
+			CanonicalizeDependencyMatchPath(record.path, sourcePath),
+		});
+	}
+	const auto compactMatches = MatchNativeDependencyRecordsMutuallyUnique(dependencyKeys, recordKeys);
+	for (size_t index = 0; index < dependencyIndices.size() && index < compactMatches.size(); ++index) {
+		result[dependencyIndices[index]] = compactMatches[index];
+	}
+	return result;
+}
+
+bool ApplyNativeDependencyDefinedIds(
+	const ProjectBundle& bundle,
+	std::vector<RestoreDependencyInfo>& dependencies,
+	NativeUnassignedDependencySymbols* outUnassigned)
+{
+	if (outUnassigned != nullptr) {
+		*outUnassigned = {};
+	}
 	if (bundle.nativeSourceBytes.empty()) {
-		return;
+		return false;
 	}
 
 	std::vector<NativeDependencySymbolRecord> nativeRecords;
 	std::string nativeError;
-	if (ExtractNativeDependencySymbols(bundle.nativeSourceBytes, nativeRecords, &nativeError)) {
-		std::vector<bool> used(nativeRecords.size(), false);
-		for (auto& dependency : dependencies) {
+	NativeUnassignedDependencySymbols extractedUnassigned;
+	if (ExtractNativeDependencySymbols(
+			bundle.nativeSourceBytes,
+			nativeRecords,
+			&nativeError,
+			outUnassigned == nullptr ? nullptr : &extractedUnassigned)) {
+		const std::vector<size_t> matches = MatchNativeDependencyRecordIndices(
+			dependencies,
+			nativeRecords,
+			bundle.sourcePath);
+		const size_t editableDependencyCount = static_cast<size_t>(std::count_if(
+			dependencies.begin(), dependencies.end(), [](const RestoreDependencyInfo& dependency) {
+				return !dependency.isSupportLibrary;
+			}));
+		std::vector<size_t> compactMatches;
+		compactMatches.reserve(editableDependencyCount);
+		for (size_t dependencyIndex = 0; dependencyIndex < dependencies.size(); ++dependencyIndex) {
+			if (!dependencies[dependencyIndex].isSupportLibrary) {
+				compactMatches.push_back(matches[dependencyIndex]);
+			}
+		}
+		const bool completeBijection = IsCompleteNativeDependencyBijection(
+			editableDependencyCount,
+			nativeRecords.size(),
+			compactMatches);
+		for (size_t dependencyIndex = 0; dependencyIndex < dependencies.size(); ++dependencyIndex) {
+			auto& dependency = dependencies[dependencyIndex];
 			if (dependency.isSupportLibrary) {
 				continue;
 			}
-
-			const std::string dependencyName = NormalizeDependencyMatchText(dependency.name);
-			const std::string dependencyPath = NormalizeDependencyMatchText(dependency.path);
-			size_t matchedIndex = nativeRecords.size();
-			for (size_t index = 0; index < nativeRecords.size(); ++index) {
-				if (used[index]) {
-					continue;
-				}
-				const std::string recordName = NormalizeDependencyMatchText(nativeRecords[index].name);
-				const std::string recordPath = NormalizeDependencyMatchText(nativeRecords[index].path);
-				if ((!dependencyPath.empty() && dependencyPath == recordPath) ||
-					(!dependencyName.empty() && dependencyName == recordName)) {
-					matchedIndex = index;
-					break;
-				}
-			}
-			if (matchedIndex == nativeRecords.size()) {
+			const size_t matchedIndex = dependencyIndex < matches.size()
+				? matches[dependencyIndex]
+				: (std::numeric_limits<size_t>::max)();
+			if (matchedIndex >= nativeRecords.size()) {
 				continue;
 			}
 
-			used[matchedIndex] = true;
-			if (dependency.definedIds.empty()) {
-				dependency.definedIds.reserve(nativeRecords[matchedIndex].definedIds.size());
-				for (const auto& range : nativeRecords[matchedIndex].definedIds) {
-					if (range.count > 0) {
-						dependency.definedIds.push_back(RestoreDependencyInfo::DefinedIdRange{
-							range.start,
-							range.count,
-						});
-					}
+			dependency.definedIds.clear();
+			dependency.definedIds.reserve(nativeRecords[matchedIndex].definedIds.size());
+			for (const auto& range : nativeRecords[matchedIndex].definedIds) {
+				if (range.count > 0) {
+					dependency.definedIds.push_back(RestoreDependencyInfo::DefinedIdRange{
+						range.start,
+						range.count,
+					});
 				}
 			}
+			dependency.hasTrustedNativeDefinedIds = !dependency.definedIds.empty();
+			dependency.hasTrustedNativeRecord = true;
+			dependency.trustedEditablePath = CanonicalizeDependencyMatchPath(
+				dependency.resolvedPath.empty() ? dependency.path : dependency.resolvedPath,
+				bundle.sourcePath);
+			dependency.trustedNativeName = NormalizeDependencyMatchText(nativeRecords[matchedIndex].name);
+			dependency.trustedNativePath = CanonicalizeDependencyMatchPath(
+				nativeRecords[matchedIndex].path,
+				bundle.sourcePath);
 			dependency.nativeClasses = nativeRecords[matchedIndex].classes;
 			dependency.nativeStructs = nativeRecords[matchedIndex].structs;
 			dependency.nativeMethods = nativeRecords[matchedIndex].methods;
 			dependency.nativeConstants = nativeRecords[matchedIndex].constants;
 		}
-		return;
+		if (outUnassigned != nullptr && completeBijection) {
+			*outUnassigned = std::move(extractedUnassigned);
+		}
+		return completeBijection;
+	}
+	if (nativeError == "invalid_ecom_defined_id_ranges") {
+		return false;
 	}
 
 	std::vector<NativeSectionSnapshot> snapshots;
 	std::string ignoredError;
 	if (!CaptureNativeSectionSnapshots(bundle.nativeSourceBytes, snapshots, &ignoredError)) {
-		return;
+		return false;
 	}
 
 	const auto sectionIt = std::find_if(
@@ -1631,42 +1750,48 @@ void ApplyNativeDependencyDefinedIds(
 		snapshots.end(),
 		[](const NativeSectionSnapshot& snapshot) { return snapshot.key == kSectionEcDependencies; });
 	if (sectionIt == snapshots.end()) {
-		return;
+		return false;
 	}
 
 	std::vector<OriginalEComDependencyRecord> records;
 	if (!ParseEComDependencySectionBytes(sectionIt->data, records)) {
-		return;
+		return false;
+	}
+	if (std::any_of(records.begin(), records.end(), [](const OriginalEComDependencyRecord& record) {
+			return record.hasInvalidDefinedIdRange;
+		})) {
+		return false;
+	}
+	std::vector<NativeDependencyRangeEvidence> rangeEvidence;
+	for (size_t recordIndex = 0; recordIndex < records.size(); ++recordIndex) {
+		for (const auto& range : records[recordIndex].definedIds) {
+			rangeEvidence.push_back(NativeDependencyRangeEvidence{ range.start, range.count, recordIndex });
+		}
+	}
+	if (!ValidateNativeDependencyRanges(rangeEvidence, NormalizeDependencyRangeType)) {
+		return false;
 	}
 
-	std::vector<bool> used(records.size(), false);
-	for (auto& dependency : dependencies) {
-		if (dependency.isSupportLibrary || !dependency.definedIds.empty()) {
+	const std::vector<size_t> matches = MatchNativeDependencyRecordIndices(
+		dependencies,
+		records,
+		bundle.sourcePath);
+	for (size_t dependencyIndex = 0; dependencyIndex < dependencies.size(); ++dependencyIndex) {
+		auto& dependency = dependencies[dependencyIndex];
+		if (dependency.isSupportLibrary) {
+			continue;
+		}
+		const size_t matchedIndex = dependencyIndex < matches.size()
+			? matches[dependencyIndex]
+			: (std::numeric_limits<size_t>::max)();
+		if (matchedIndex >= records.size()) {
 			continue;
 		}
 
-		const std::string dependencyName = NormalizeDependencyMatchText(dependency.name);
-		const std::string dependencyPath = NormalizeDependencyMatchText(dependency.path);
-		size_t matchedIndex = records.size();
-		for (size_t index = 0; index < records.size(); ++index) {
-			if (used[index]) {
-				continue;
-			}
-			const std::string recordName = NormalizeDependencyMatchText(records[index].name);
-			const std::string recordPath = NormalizeDependencyMatchText(records[index].path);
-			if ((!dependencyPath.empty() && dependencyPath == recordPath) ||
-				(!dependencyName.empty() && dependencyName == recordName)) {
-				matchedIndex = index;
-				break;
-			}
-		}
-		if (matchedIndex == records.size()) {
-			continue;
-		}
-
-		used[matchedIndex] = true;
 		dependency.definedIds = records[matchedIndex].definedIds;
+		dependency.hasTrustedNativeDefinedIds = !dependency.definedIds.empty();
 	}
+	return false;
 }
 
 void AssignDependencyChildIdSpans(std::vector<RestoreDependencyInfo>& dependencies)
@@ -1715,8 +1840,10 @@ void AssignDependencyChildIdSpans(std::vector<RestoreDependencyInfo>& dependenci
 
 	for (size_t index = 0; index < spans.size(); ++index) {
 		auto& dependency = dependencies[spans[index].dependencyIndex];
-		dependency.childIdStart = spans[index].maxTopIdNum + 1;
-		dependency.childIdEnd = (std::numeric_limits<std::int32_t>::max)();
+		dependency.childIdStart = spans[index].maxTopIdNum < epl_system_id::kMaskNum
+			? spans[index].maxTopIdNum + 1
+			: 0;
+		dependency.childIdEnd = epl_system_id::kMaskNum;
 		if (index + 1 < spans.size() && spans[index + 1].minTopIdNum > dependency.childIdStart) {
 			dependency.childIdEnd = spans[index + 1].minTopIdNum - 1;
 		}
@@ -1725,9 +1852,14 @@ void AssignDependencyChildIdSpans(std::vector<RestoreDependencyInfo>& dependenci
 
 class DependencyImportIdCursor {
 public:
-	explicit DependencyImportIdCursor(const RestoreDependencyInfo& dependency)
+	DependencyImportIdCursor(
+		const RestoreDependencyInfo& dependency,
+		NativeChildIdRegistry& childIds,
+		const size_t ownerToken)
 		: m_childNext(dependency.childIdStart)
 		, m_childEnd(dependency.childIdEnd)
+		, m_childIds(childIds)
+		, m_ownerToken(ownerToken)
 	{
 		for (const auto& range : dependency.definedIds) {
 			if (range.count <= 0) {
@@ -1810,24 +1942,55 @@ public:
 		return AllocTopLevel(allocator, typeMask);
 	}
 
+	std::int32_t AllocTopLevelFromImportedSymbol(
+		IdAllocator& allocator,
+		const std::int32_t typeMask,
+		const std::int32_t importedId)
+	{
+		// Symbols extracted from the host project's removed-defined records carry
+		// the ID used by its native expressions. Some legacy EC records persist
+		// only a subset of top-level categories, so range membership alone cannot
+		// reject this stronger owner/name-backed evidence.
+		if ((importedId & epl_system_id::kMaskType) == typeMask &&
+			MarkTopLevelUsed(typeMask, importedId)) {
+			allocator.Observe(importedId);
+			return importedId;
+		}
+		return AllocTopLevel(allocator, typeMask);
+	}
+
 	std::int32_t AllocChild(IdAllocator& allocator, const std::int32_t typeMask)
 	{
-		if (m_hasOriginalRanges && m_childNext > 0 && m_childNext <= m_childEnd) {
+		while (m_hasOriginalRanges && m_childNext > 0 &&
+			m_childNext <= m_childEnd && m_childNext <= epl_system_id::kMaskNum) {
 			const std::int32_t id = typeMask | m_childNext;
 			++m_childNext;
-			allocator.Observe(id);
-			return id;
+			if (m_childIds.TryClaimSequential(id, typeMask, m_ownerToken)) {
+				allocator.Observe(id);
+				return id;
+			}
 		}
-		return allocator.Alloc(typeMask);
+		for (;;) {
+			const std::int32_t id = allocator.Alloc(typeMask);
+			if (!IsWellFormedNativeIdOfType(id, typeMask)) {
+				return 0;
+			}
+			if (m_childIds.TryClaimSequential(id, typeMask, m_ownerToken)) {
+				return id;
+			}
+		}
 	}
 
 	std::int32_t AllocChild(IdAllocator& allocator, const std::int32_t typeMask, const std::int32_t preferredId)
 	{
-		if ((preferredId & epl_system_id::kMaskType) == typeMask) {
+		if (preferredId == 0) {
+			return AllocChild(allocator, typeMask);
+		}
+		if (m_childIds.TryClaimPreferred(preferredId, typeMask, m_ownerToken)) {
 			allocator.Observe(preferredId);
 			return preferredId;
 		}
-		return AllocChild(allocator, typeMask);
+		return 0;
 	}
 
 private:
@@ -1882,6 +2045,8 @@ private:
 	bool m_hasOriginalRanges = false;
 	std::int32_t m_childNext = 0;
 	std::int32_t m_childEnd = 0;
+	NativeChildIdRegistry& m_childIds;
+	size_t m_ownerToken = 0;
 	std::unordered_map<std::int32_t, Cursor> m_cursors;
 	std::unordered_set<std::int64_t> m_usedTopLevelSlots;
 };
@@ -2070,6 +2235,25 @@ public:
 		const std::string& rawMethodName,
 		SupportLibraryCommandInfo& outInfo) const
 	{
+		SupportLibraryCommandInfo rawInfo;
+		if (TryParseRawSupportLibrarySymbol(
+				rawMethodName,
+				"Cmd",
+				m_supportLibraryOrder.size(),
+				rawInfo.libraryId,
+				rawInfo.commandId)) {
+			// A raw member alias already carries its stable library/command identity.
+			// Accept it only when the receiver belongs to that same support library.
+			const std::int32_t ownerLibraryId = (typeId >> 16) - 1;
+			if (epl_system_id::IsLibDataType(typeId) &&
+				(typeId & 0xFFFF) != 0 &&
+				ownerLibraryId == rawInfo.libraryId) {
+				outInfo = rawInfo;
+				return true;
+			}
+			outInfo = {};
+			return false;
+		}
 		const std::string methodName = NormalizeTypeName(rawMethodName);
 		if (methodName.empty()) {
 			outInfo = {};
@@ -3598,6 +3782,30 @@ bool DecodeNativeLineOffsets(const std::vector<std::uint8_t>& bytes, std::vector
 	return true;
 }
 
+bool NativeMethodReferencesAnyEvidenceId(
+	const BundleNativeMethodSnapshot& nativeMethod,
+	const std::unordered_set<std::int32_t>& unstableIds)
+{
+	if (unstableIds.empty()) {
+		return false;
+	}
+
+	std::vector<std::int32_t> methodReferences;
+	std::vector<std::int32_t> variableReferences;
+	std::vector<std::int32_t> constantReferences;
+	if (!DecodeNativeLineOffsets(nativeMethod.methodReference, methodReferences) ||
+		!DecodeNativeLineOffsets(nativeMethod.variableReference, variableReferences) ||
+		!DecodeNativeLineOffsets(nativeMethod.constantReference, constantReferences)) {
+		return true;
+	}
+	return NativeExpressionReferenceSlotsContainAnyEvidenceId(
+		nativeMethod.expressionData,
+		methodReferences,
+		variableReferences,
+		constantReferences,
+		unstableIds);
+}
+
 bool IsFlatRawStatementList(const std::vector<BodyStatement>& statements)
 {
 	return std::all_of(
@@ -3658,6 +3866,7 @@ struct FlatReusableNativeLine {
 struct ReusableNativeLineSegment {
 	ReusableNativeLineKind kind = ReusableNativeLineKind::Raw;
 	bool mask = false;
+	bool reusable = true;
 	std::string code;
 	std::vector<std::uint8_t> data;
 	std::vector<std::int32_t> methodReferences;
@@ -3708,6 +3917,7 @@ void CollectReusableNativeLines(
 bool CollectOriginalReusableNativeLineSegments(
 	const std::vector<BodyStatement>& statements,
 	const BundleNativeMethodSnapshot& nativeMethod,
+	const std::unordered_set<std::int32_t>& invalidNativeReferenceIds,
 	std::vector<ReusableNativeLineSegment>& outSegments);
 
 std::vector<size_t> BuildReusableNativeLineMatches(
@@ -4189,8 +4399,61 @@ struct NativeObjectMethodEncodeContext {
 	std::unordered_map<std::string, NativeFunctionSymbol> localFunctionsByName;
 	std::unordered_map<std::string, NativeFunctionSymbol> functionsByName;
 	std::unordered_map<std::int32_t, std::unordered_map<std::string, NativeFunctionSymbol>> methodsByOwnerType;
+	// A window assembly may call methods from its bound support Window type without an explicit target.
+	std::int32_t implicitSupportTypeId = 0;
 	const TypeResolver* typeResolver = nullptr;
 };
+
+std::string BuildRawNativeConstantAlias(const std::int32_t id)
+{
+	std::string_view prefix;
+	switch (epl_system_id::GetType(id)) {
+	case epl_system_id::kTypeConstant: prefix = "_Const_0x"; break;
+	case epl_system_id::kTypeImageResource: prefix = "_Img_0x"; break;
+	case epl_system_id::kTypeSoundResource: prefix = "_Sound_0x"; break;
+	default: return std::string();
+	}
+
+	std::ostringstream stream;
+	stream << prefix << std::hex << std::uppercase <<
+		static_cast<std::uint32_t>(id & epl_system_id::kMaskNum);
+	return stream.str();
+}
+
+void RegisterRawNativeConstantAliases(
+	const BundleNativeMethodSnapshot& nativeMethod,
+	NativeObjectMethodEncodeContext& context)
+{
+	std::vector<std::int32_t> references;
+	if (!DecodeNativeLineOffsets(nativeMethod.constantReference, references)) {
+		return;
+	}
+	for (const std::int32_t reference : references) {
+		if (reference < 0) {
+			continue;
+		}
+		const size_t offset = static_cast<size_t>(reference);
+		if (offset + 1 + sizeof(std::int32_t) > nativeMethod.expressionData.size() ||
+			nativeMethod.expressionData[offset] != 0x1B) {
+			continue;
+		}
+
+		std::int32_t id = 0;
+		std::memcpy(
+			&id,
+			nativeMethod.expressionData.data() + offset + 1,
+			sizeof(id));
+		const std::string alias = BuildRawNativeConstantAlias(id);
+		const std::string key = TypeResolver::NormalizeTypeName(alias);
+		if (key.empty()) {
+			continue;
+		}
+		// A raw alias may be restored only when the same method's native snapshot
+		// proves the complete constant/resource id. This keeps anonymous imported
+		// constants round-trippable without accepting arbitrary hexadecimal ids.
+		context.constantsByName.insert_or_assign(key, NativeConstantSymbol{ -2, id });
+	}
+}
 
 bool StartsWithAt(const std::string& text, const size_t offset, const std::string_view token)
 {
@@ -4935,6 +5198,14 @@ bool TryResolveNativeFunction(
 			outSymbol = NativeFunctionSymbol{ commandInfo.libraryId, commandInfo.commandId };
 			return true;
 		}
+		if (context.implicitSupportTypeId != 0 &&
+			context.typeResolver->TryResolveSupportTypeMethod(
+				context.implicitSupportTypeId,
+				rawName,
+				commandInfo)) {
+			outSymbol = NativeFunctionSymbol{ commandInfo.libraryId, commandInfo.commandId };
+			return true;
+		}
 	}
 	const auto functionIt = context.functionsByName.find(functionKey);
 	if (functionIt != context.functionsByName.end()) {
@@ -5036,7 +5307,10 @@ bool TryResolveNativeOwnerMethod(
 	}
 	if (context.typeResolver != nullptr) {
 		SupportLibraryCommandInfo supportMethod;
-		if (context.typeResolver->TryResolveSupportTypeMethod(ownerType, rawName, supportMethod)) {
+		const auto aliasIt = context.supportMemberTypeByOwnerType.find(ownerType);
+		const std::int32_t supportType = aliasIt == context.supportMemberTypeByOwnerType.end()
+			? ownerType : aliasIt->second;
+		if (context.typeResolver->TryResolveSupportTypeMethod(supportType, rawName, supportMethod)) {
 			outSymbol = NativeFunctionSymbol{ supportMethod.libraryId, supportMethod.commandId };
 			return true;
 		}
@@ -6271,6 +6545,8 @@ bool BuildNativeMethodReferenceSegments(
 	const BundleNativeMethodSnapshot& nativeMethod,
 	std::vector<NativeExpressionSegment>& outSegments);
 
+bool ContainsRawSupportLibraryObjectCall(std::string_view text);
+
 bool HasChangedNativeObjectMethodLine(
 	const std::vector<std::string>& currentLines,
 	const std::vector<std::string>& originalLines,
@@ -6626,6 +6902,7 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 	const BundleNativeMethodSnapshot& nativeMethod,
 	RestoreMethod& outMethod,
 	const NativeObjectMethodEncodeContext& encodeContext,
+	const std::unordered_set<std::int32_t>& invalidNativeReferenceIds,
 	std::string* outError)
 {
 	const EffectiveMethodBodyLines effectiveCurrentLines = BuildEffectiveMethodBodyLinesForEncoding(currentLines);
@@ -6658,7 +6935,11 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 	}
 
 	std::vector<ReusableNativeLineSegment> originalSegments;
-	if (!CollectOriginalReusableNativeLineSegments(originalStatements, nativeMethod, originalSegments) ||
+	if (!CollectOriginalReusableNativeLineSegments(
+			originalStatements,
+			nativeMethod,
+			invalidNativeReferenceIds,
+			originalSegments) ||
 		originalSegments.empty()) {
 		return false;
 	}
@@ -6695,6 +6976,11 @@ bool TryBuildMethodCodeDataWithReusableNativeLineSegments(
 		}
 
 		const size_t matchedIndex = reuseMatches[reusableLineIndex++];
+		if (ContainsRawSupportLibraryObjectCall(code)) {
+			// The raw alias is stable, but its saved expression may contain malformed
+			// receiver binding. Re-encode this line while retaining other proven lines.
+			return std::nullopt;
+		}
 		if (matchedIndex == (std::numeric_limits<size_t>::max)()) {
 			return std::nullopt;
 		}
@@ -7631,7 +7917,8 @@ bool AreReusableNativeLinesEquivalent(
 	const FlatReusableNativeLine& left,
 	const ReusableNativeLineSegment& right)
 {
-	return left.kind == right.kind &&
+	return right.reusable &&
+		left.kind == right.kind &&
 		left.mask == right.mask &&
 		left.code == right.code;
 }
@@ -7832,6 +8119,7 @@ bool CollectOriginalReusableNativeLineSegmentsRecursive(
 bool CollectOriginalReusableNativeLineSegments(
 	const std::vector<BodyStatement>& statements,
 	const BundleNativeMethodSnapshot& nativeMethod,
+	const std::unordered_set<std::int32_t>& invalidNativeReferenceIds,
 	std::vector<ReusableNativeLineSegment>& outSegments)
 {
 	outSegments.clear();
@@ -7848,7 +8136,7 @@ bool CollectOriginalReusableNativeLineSegments(
 	}
 
 	size_t lineIndex = 0;
-	return CollectOriginalReusableNativeLineSegmentsRecursive(
+	if (!CollectOriginalReusableNativeLineSegmentsRecursive(
 		statements,
 		nativeMethod,
 		lineOffsets,
@@ -7856,7 +8144,19 @@ bool CollectOriginalReusableNativeLineSegments(
 		variableReferences,
 		constantReferences,
 		lineIndex,
-		outSegments);
+		outSegments)) {
+		return false;
+	}
+	for (auto& segment : outSegments) {
+		segment.reusable =
+			!NativeExpressionReferenceSlotsContainAnyEvidenceId(
+				segment.data,
+				segment.methodReferences,
+				segment.variableReferences,
+				segment.constantReferences,
+				invalidNativeReferenceIds);
+	}
+	return true;
 }
 
 std::vector<size_t> BuildReusableNativeLineMatches(
@@ -8516,16 +8816,125 @@ struct PreparedFormHandlerSymbol {
 	std::int32_t methodId = 0;
 };
 
-std::int32_t ResolveHandlerMethodId(
+enum class RawFormHandlerParseResult {
+	NotRaw,
+	Valid,
+	Invalid,
+};
+
+RawFormHandlerParseResult ParseRawFormHandlerId(
+	const std::string& rawMethodName,
+	std::int32_t& outMethodId)
+{
+	outMethodId = 0;
+	constexpr std::string_view kPrefix = "_Sub_0x";
+	const std::string methodName = TrimAsciiCopy(rawMethodName);
+	if (!StartsWith(methodName, kPrefix)) {
+		return RawFormHandlerParseResult::NotRaw;
+	}
+
+	const std::string_view suffix(methodName.data() + kPrefix.size(), methodName.size() - kPrefix.size());
+	if (suffix.empty() || suffix.size() > 6 ||
+		!std::all_of(suffix.begin(), suffix.end(), [](const unsigned char ch) {
+			return std::isxdigit(ch) != 0;
+		})) {
+		return RawFormHandlerParseResult::Invalid;
+	}
+
+	std::uint32_t value = 0;
+	const auto [parseEnd, parseError] = std::from_chars(
+		suffix.data(), suffix.data() + suffix.size(), value, 16);
+	if (parseError != std::errc() || parseEnd != suffix.data() + suffix.size() ||
+		value > static_cast<std::uint32_t>(epl_system_id::kMaskNum)) {
+		return RawFormHandlerParseResult::Invalid;
+	}
+	outMethodId = epl_system_id::kTypeMethod | static_cast<std::int32_t>(value);
+	return RawFormHandlerParseResult::Valid;
+}
+
+bool TryGetProvenFormHandlerId(
+	const BundleNativeFormElementSnapshot* nativeElement,
+	const std::int32_t eventKey,
+	const bool isMenuClick,
+	std::int32_t& outHandlerId)
+{
+	outHandlerId = 0;
+	if (nativeElement == nullptr) {
+		return false;
+	}
+	if (isMenuClick) {
+		if (!nativeElement->isMenu ||
+			epl_system_id::GetType(nativeElement->clickEvent) != epl_system_id::kTypeMethod) {
+			return false;
+		}
+		outHandlerId = nativeElement->clickEvent;
+		return true;
+	}
+	if (nativeElement->isMenu) {
+		return false;
+	}
+
+	bool matched = false;
+	for (const auto& [candidateEventKey, candidateHandlerId] : nativeElement->events) {
+		if (candidateEventKey != eventKey ||
+			epl_system_id::GetType(candidateHandlerId) != epl_system_id::kTypeMethod) {
+			continue;
+		}
+		if (matched && outHandlerId != candidateHandlerId) {
+			outHandlerId = 0;
+			return false;
+		}
+		matched = true;
+		outHandlerId = candidateHandlerId;
+	}
+	return matched;
+}
+
+bool ResolveHandlerMethodId(
 	const std::string& rawHandlerName,
 	const std::int32_t preferredOwnerClassId,
 	const RestoreDocumentModel& model,
-	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers)
+	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers,
+	const BundleNativeFormElementSnapshot* nativeElement,
+	const std::int32_t eventKey,
+	const bool isMenuClick,
+	const std::string& formName,
+	const std::string& elementName,
+	std::int32_t& outHandlerId,
+	std::string* outError)
 {
+	outHandlerId = 0;
 	std::string ownerName;
 	std::string methodName;
 	if (!SplitQualifiedHandlerName(rawHandlerName, ownerName, methodName)) {
-		return 0;
+		return true;
+	}
+
+	std::int32_t rawMethodId = 0;
+	const RawFormHandlerParseResult rawParseResult = ParseRawFormHandlerId(methodName, rawMethodId);
+	if (rawParseResult == RawFormHandlerParseResult::Invalid) {
+		if (outError != nullptr) {
+			*outError = "invalid_raw_form_handler: form=" + formName +
+				", element=" + elementName + ", handler=" + TrimAsciiCopy(rawHandlerName);
+		}
+		return false;
+	}
+	if (rawParseResult == RawFormHandlerParseResult::Valid) {
+		std::int32_t provenMethodId = 0;
+		if (!TryGetProvenFormHandlerId(nativeElement, eventKey, isMenuClick, provenMethodId) ||
+			provenMethodId != rawMethodId) {
+			if (outError != nullptr) {
+				std::ostringstream stream;
+				stream << "raw_form_handler_not_proven: form=" << formName
+					<< ", element=" << elementName
+					<< ", event=" << (isMenuClick ? "menu_click" : std::to_string(eventKey))
+					<< ", handler=" << TrimAsciiCopy(rawHandlerName);
+				*outError = stream.str();
+			}
+			return false;
+		}
+		outHandlerId = rawMethodId;
+		return true;
 	}
 
 	std::int32_t resolvedOwnerClassId = 0;
@@ -8542,14 +8951,16 @@ std::int32_t ResolveHandlerMethodId(
 		if (preparedHandlers != nullptr) {
 			for (const auto& handler : *preparedHandlers) {
 				if (handler.ownerClassId == preferredOwnerClassId && handler.methodName == methodName) {
-					return handler.methodId;
+					outHandlerId = handler.methodId;
+					return true;
 				}
 			}
 		}
 		for (const auto& method : model.methods) {
 			if (method.ownerClass == preferredOwnerClassId &&
 				TypeResolver::NormalizeTypeName(method.name) == methodName) {
-				return method.id;
+				outHandlerId = method.id;
+				return true;
 			}
 		}
 	}
@@ -8558,14 +8969,16 @@ std::int32_t ResolveHandlerMethodId(
 		if (preparedHandlers != nullptr) {
 			for (const auto& handler : *preparedHandlers) {
 				if (handler.ownerClassId == resolvedOwnerClassId && handler.methodName == methodName) {
-					return handler.methodId;
+					outHandlerId = handler.methodId;
+					return true;
 				}
 			}
 		}
 		for (const auto& method : model.methods) {
 			if (method.ownerClass == resolvedOwnerClassId &&
 				TypeResolver::NormalizeTypeName(method.name) == methodName) {
-				return method.id;
+				outHandlerId = method.id;
+				return true;
 			}
 		}
 	}
@@ -8576,7 +8989,7 @@ std::int32_t ResolveHandlerMethodId(
 			continue;
 		}
 		if (uniqueMatch != 0) {
-			return 0;
+			return true;
 		}
 		uniqueMatch = method.id;
 	}
@@ -8586,56 +8999,132 @@ std::int32_t ResolveHandlerMethodId(
 				continue;
 			}
 			if (uniqueMatch != 0 && uniqueMatch != handler.methodId) {
-				return 0;
+				return true;
 			}
 			uniqueMatch = handler.methodId;
 		}
 	}
-	return uniqueMatch;
+	outHandlerId = uniqueMatch;
+	return true;
 }
 
-std::vector<std::pair<std::int32_t, std::int32_t>> ReadFormControlEventsFromXml(
+bool ReadFormControlEventsFromXml(
 	const SimpleXmlNode& node,
 	const std::string& eventNodeName,
 	const std::int32_t preferredOwnerClassId,
 	const RestoreDocumentModel& model,
-	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers)
+	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers,
+	const BundleNativeFormElementSnapshot* nativeElement,
+	const std::string& formName,
+	const std::string& elementName,
+	std::vector<std::pair<std::int32_t, std::int32_t>>& outEvents,
+	std::string* outError)
 {
-	std::vector<std::pair<std::int32_t, std::int32_t>> events;
+	outEvents.clear();
+	std::unordered_map<std::int32_t, size_t> eventIndexByKey;
 	for (const auto& child : node.children) {
 		if (child.name != eventNodeName) {
 			continue;
 		}
 		const std::int32_t eventKey = GetXmlIntAttribute(child, "索引", -1);
 		if (eventKey < 0) {
+			// A raw handler without an event index cannot be tied to native evidence.
+			// Resolve it only to surface the explicit raw-identity diagnostic; named
+			// handlers retain the historical behavior of ignoring malformed entries.
+			std::int32_t ignoredHandlerId = 0;
+			if (!ResolveHandlerMethodId(
+					GetXmlAttribute(child, "处理器"),
+					preferredOwnerClassId,
+					model,
+					preparedHandlers,
+					nativeElement,
+					-1,
+					false,
+					formName,
+					elementName,
+					ignoredHandlerId,
+					outError)) {
+				return false;
+			}
 			continue;
 		}
-		const std::int32_t handlerId = ResolveHandlerMethodId(
-			GetXmlAttribute(child, "处理器"),
-			preferredOwnerClassId,
-			model,
-			preparedHandlers);
-		events.emplace_back(eventKey, handlerId);
-	}
-	return events;
-}
-
-std::int32_t ReadFormMenuClickEventFromXml(
-	const SimpleXmlNode& node,
-	const std::int32_t preferredOwnerClassId,
-	const RestoreDocumentModel& model,
-	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers)
-{
-	for (const auto& child : node.children) {
-		if (child.name == "菜单.事件") {
-			return ResolveHandlerMethodId(
+		std::int32_t handlerId = 0;
+		if (!ResolveHandlerMethodId(
 				GetXmlAttribute(child, "处理器"),
 				preferredOwnerClassId,
 				model,
-				preparedHandlers);
+				preparedHandlers,
+				nativeElement,
+				eventKey,
+				false,
+				formName,
+				elementName,
+				handlerId,
+				outError)) {
+			return false;
+		}
+		if (const auto eventIt = eventIndexByKey.find(eventKey); eventIt != eventIndexByKey.end()) {
+			auto& existingHandlerId = outEvents[eventIt->second].second;
+			if (existingHandlerId != 0 && handlerId != 0 && existingHandlerId != handlerId) {
+				if (outError != nullptr) {
+					*outError = "conflicting_form_event_handlers: form=" + formName +
+						", element=" + elementName + ", event=" + std::to_string(eventKey);
+				}
+				return false;
+			}
+			if (existingHandlerId == 0 && handlerId != 0) {
+				existingHandlerId = handlerId;
+			}
+			continue;
+		}
+		eventIndexByKey.insert_or_assign(eventKey, outEvents.size());
+		outEvents.emplace_back(eventKey, handlerId);
+	}
+	return true;
+}
+
+bool ReadFormMenuClickEventFromXml(
+	const SimpleXmlNode& node,
+	const std::int32_t preferredOwnerClassId,
+	const RestoreDocumentModel& model,
+	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers,
+	const BundleNativeFormElementSnapshot* nativeElement,
+	const std::string& formName,
+	const std::string& elementName,
+	std::int32_t& outHandlerId,
+	std::string* outError)
+{
+	outHandlerId = 0;
+	for (const auto& child : node.children) {
+		if (child.name == "菜单.事件") {
+			std::int32_t handlerId = 0;
+			if (!ResolveHandlerMethodId(
+					GetXmlAttribute(child, "处理器"),
+					preferredOwnerClassId,
+					model,
+					preparedHandlers,
+					nativeElement,
+					-1,
+					true,
+					formName,
+					elementName,
+					handlerId,
+					outError)) {
+				return false;
+			}
+			if (outHandlerId != 0 && handlerId != 0 && outHandlerId != handlerId) {
+				if (outError != nullptr) {
+					*outError = "conflicting_menu_handlers: form=" + formName +
+						", element=" + elementName;
+				}
+				return false;
+			}
+			if (outHandlerId == 0 && handlerId != 0) {
+				outHandlerId = handlerId;
+			}
 		}
 	}
-	return 0;
+	return true;
 }
 
 std::int16_t BuildVariableAttr(const ParsedVariableDef& definition, const bool allowStatic, const bool allowPublic)
@@ -8662,6 +9151,89 @@ std::int16_t BuildVariableAttr(const ParsedVariableDef& definition, const bool a
 	return attr;
 }
 
+std::int32_t GetParsedClassNativeKind(const ParsedClassDef& definition)
+{
+	if (definition.isFormClass) {
+		return epl_system_id::kTypeFormClass;
+	}
+	return definition.isUserClass
+		? epl_system_id::kTypeClass
+		: epl_system_id::kTypeStaticClass;
+}
+
+void AppendSignatureField(std::ostringstream& stream, const std::string& value)
+{
+	stream << value.size() << ':' << value << ';';
+}
+
+std::string BuildParsedMethodDeclarationSignature(const ParsedMethodDef& method)
+{
+	std::ostringstream stream;
+	AppendSignatureField(stream, TypeResolver::NormalizeTypeName(method.returnTypeName));
+	stream << method.params.size() << ';';
+	constexpr std::int16_t kSignatureAttrMask =
+		kVarAttrByRef | kVarAttrNullable | kVarAttrArray;
+	for (const auto& param : method.params) {
+		AppendSignatureField(stream, TypeResolver::NormalizeTypeName(param.typeName));
+		stream << (BuildVariableAttr(param, false, false) & kSignatureAttrMask) << ':';
+		const auto bounds = ParseArrayBounds(param.arrayText);
+		stream << bounds.size() << ':';
+		for (const auto bound : bounds) {
+			stream << bound << ',';
+		}
+		stream << ';';
+	}
+	return stream.str();
+}
+
+std::string BuildPublicOwnerDeclarationKey(
+	const std::int32_t ownerKind,
+	const std::string& normalizedOwnerName)
+{
+	return std::to_string(ownerKind) + ":" + normalizedOwnerName;
+}
+
+std::string BuildPublicMethodDeclarationKey(
+	const ParsedClassDef& owner,
+	const ParsedMethodDef& method)
+{
+	std::ostringstream stream;
+	AppendSignatureField(stream, BuildPublicOwnerDeclarationKey(
+		GetParsedClassNativeKind(owner),
+		TypeResolver::NormalizeTypeName(owner.name)));
+	AppendSignatureField(stream, TypeResolver::NormalizeTypeName(method.name));
+	AppendSignatureField(stream, BuildParsedMethodDeclarationSignature(method));
+	return stream.str();
+}
+
+std::string BuildParsedStructDeclarationSignature(const ParsedStructDef& definition)
+{
+	std::ostringstream stream;
+	stream << definition.members.size() << ';';
+	constexpr std::int16_t kSignatureAttrMask =
+		kVarAttrByRef | kVarAttrNullable | kVarAttrArray;
+	for (const auto& member : definition.members) {
+		AppendSignatureField(stream, TypeResolver::NormalizeTypeName(member.name));
+		AppendSignatureField(stream, TypeResolver::NormalizeTypeName(member.typeName));
+		stream << (BuildVariableAttr(member, false, false) & kSignatureAttrMask) << ':';
+		const auto bounds = ParseArrayBounds(member.arrayText);
+		stream << bounds.size() << ':';
+		for (const auto bound : bounds) {
+			stream << bound << ',';
+		}
+		stream << ';';
+	}
+	return stream.str();
+}
+
+std::string BuildPublicStructDeclarationKey(const ParsedStructDef& definition)
+{
+	std::ostringstream stream;
+	AppendSignatureField(stream, TypeResolver::NormalizeTypeName(definition.name));
+	AppendSignatureField(stream, BuildParsedStructDeclarationSignature(definition));
+	return stream.str();
+}
+
 std::int32_t ResolveFormElementTypeId(const std::string& tagName, TypeResolver& resolver)
 {
 	const std::string normalized = TypeResolver::NormalizeTypeName(tagName);
@@ -8685,21 +9257,108 @@ std::int32_t ResolveFormElementTypeId(const std::string& tagName, TypeResolver& 
 	return resolver.ResolveTypeId(normalized);
 }
 
-void BuildFormControlTree(
+struct NativeFormElementIdentityPool {
+	explicit NativeFormElementIdentityPool(
+		const BundleNativeFormSnapshot* value,
+		const bool valueProvesHandlers)
+		: snapshot(value),
+		  provesHandlers(valueProvesHandlers),
+		  used(value != nullptr ? value->elements.size() : 0, false)
+	{
+	}
+
+	std::int32_t Take(
+		const std::string& rawName,
+		const bool isMenu,
+		const bool isFormSelf,
+		const std::int32_t dataType,
+		const BundleNativeFormElementSnapshot*& outHandlerEvidence)
+	{
+		outHandlerEvidence = nullptr;
+		if (snapshot == nullptr) {
+			return 0;
+		}
+		const std::string name = TypeResolver::NormalizeTypeName(rawName);
+		std::optional<size_t> matchedIndex;
+		for (size_t index = 0; index < snapshot->elements.size(); ++index) {
+			const auto& candidate = snapshot->elements[index];
+			if (used[index] ||
+				candidate.isMenu != isMenu ||
+				candidate.isFormSelf != isFormSelf ||
+				candidate.dataType != dataType ||
+				TypeResolver::NormalizeTypeName(candidate.name) != name) {
+				continue;
+			}
+			if (matchedIndex.has_value()) {
+				// An element name is not sufficient to choose between multiple native
+				// identities. Allocate a fresh id and withhold handler evidence.
+				return 0;
+			}
+			matchedIndex = index;
+		}
+		if (!matchedIndex.has_value()) {
+			return 0;
+		}
+
+		const size_t index = *matchedIndex;
+		const auto& candidate = snapshot->elements[index];
+		std::int32_t id = candidate.id;
+		if (id == 0) {
+			return 0;
+		}
+		if (epl_system_id::GetType(id) == 0) {
+			id |= isFormSelf
+				? epl_system_id::kTypeFormSelf
+				: (isMenu ? epl_system_id::kTypeFormMenu : epl_system_id::kTypeFormControl);
+		}
+		const std::int32_t expectedType = isFormSelf
+			? epl_system_id::kTypeFormSelf
+			: (isMenu ? epl_system_id::kTypeFormMenu : epl_system_id::kTypeFormControl);
+		if (epl_system_id::GetType(id) != expectedType) {
+			return 0;
+		}
+		used[index] = true;
+		if (provesHandlers) {
+			outHandlerEvidence = &candidate;
+		}
+		return id;
+	}
+
+	void DisableHandlerEvidence()
+	{
+		provesHandlers = false;
+	}
+
+	const BundleNativeFormSnapshot* snapshot = nullptr;
+	bool provesHandlers = false;
+	std::vector<bool> used;
+};
+
+bool BuildFormControlTree(
 	const SimpleXmlNode& node,
 	const std::int32_t parentId,
+	const std::string& formName,
 	const std::int32_t preferredOwnerClassId,
 	const RestoreDocumentModel& model,
 	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers,
 	TypeResolver& resolver,
 	IdAllocator& allocator,
+	NativeFormElementIdentityPool* identityPool,
 	std::vector<RestoreFormElement>& outElements,
-	std::vector<std::int32_t>& outChildren)
+	std::vector<std::int32_t>& outChildren,
+	std::string* outError)
 {
 	RestoreFormElement element;
-	element.id = allocator.Alloc(epl_system_id::kTypeFormControl);
+	const std::string elementName = GetXmlAttribute(node, "名称");
 	element.dataType = ResolveFormElementTypeId(node.name, resolver);
-	element.name = GetXmlAttribute(node, "名称");
+	const BundleNativeFormElementSnapshot* handlerEvidence = nullptr;
+	element.id = identityPool != nullptr
+		? identityPool->Take(elementName, false, false, element.dataType, handlerEvidence)
+		: 0;
+	if (element.id == 0) {
+		element.id = allocator.Alloc(epl_system_id::kTypeFormControl);
+	}
+	element.name = elementName;
 	element.comment = GetXmlAttribute(node, "备注");
 	element.parent = parentId;
 	element.left = GetXmlIntAttribute(node, "左边", 0);
@@ -8714,12 +9373,19 @@ void BuildFormControlTree(
 	element.locked = GetXmlBoolAttribute(node, "锁定", false);
 	element.tabIndex = GetXmlIntAttribute(node, "停留顺序", 0);
 	element.extensionData = DecodeBase64(GetXmlAttribute(node, "扩展属性数据"));
-	element.events = ReadFormControlEventsFromXml(
-		node,
-		node.name + ".事件",
-		preferredOwnerClassId,
-		model,
-		preparedHandlers);
+	if (!ReadFormControlEventsFromXml(
+			node,
+			node.name + ".事件",
+			preferredOwnerClassId,
+			model,
+			preparedHandlers,
+			handlerEvidence,
+			formName,
+			elementName,
+			element.events,
+			outError)) {
+		return false;
+	}
 
 	std::vector<std::int32_t> childIds;
 	const bool isTabControl = resolver.IsTabControlType(element.dataType);
@@ -8737,16 +9403,21 @@ void BuildFormControlTree(
 				if (StartsWith(tabChild.name, node.name + ".")) {
 					continue;
 				}
-				BuildFormControlTree(
+				if (!BuildFormControlTree(
 					tabChild,
 					element.id,
+					formName,
 					preferredOwnerClassId,
 					model,
 					preparedHandlers,
 					resolver,
 					allocator,
+					identityPool,
 					outElements,
-					childIds);
+					childIds,
+					outError)) {
+					return false;
+				}
 			}
 		}
 	}
@@ -8755,68 +9426,99 @@ void BuildFormControlTree(
 			if (StartsWith(child.name, node.name + ".")) {
 				continue;
 			}
-			BuildFormControlTree(
+			if (!BuildFormControlTree(
 				child,
 				element.id,
+				formName,
 				preferredOwnerClassId,
 				model,
 				preparedHandlers,
 				resolver,
 				allocator,
+				identityPool,
 				outElements,
-				childIds);
+				childIds,
+				outError)) {
+				return false;
+			}
 		}
 	}
 	element.children = std::move(childIds);
 	outChildren.push_back(element.id);
 	outElements.push_back(std::move(element));
+	return true;
 }
 
-void BuildFormMenus(
+bool BuildFormMenus(
 	const SimpleXmlNode& node,
 	const int level,
+	const std::string& formName,
 	const std::int32_t preferredOwnerClassId,
 	const RestoreDocumentModel& model,
 	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers,
 	IdAllocator& allocator,
-	std::vector<RestoreFormElement>& outElements)
+	NativeFormElementIdentityPool* identityPool,
+	std::vector<RestoreFormElement>& outElements,
+	std::string* outError)
 {
 	for (const auto& child : node.children) {
 		if (child.name != "菜单") {
 			continue;
 		}
 		RestoreFormElement element;
-		element.id = allocator.Alloc(epl_system_id::kTypeFormMenu);
+		const std::string elementName = GetXmlAttribute(child, "名称");
 		element.dataType = 65539;
+		const BundleNativeFormElementSnapshot* handlerEvidence = nullptr;
+		element.id = identityPool != nullptr
+			? identityPool->Take(elementName, true, false, element.dataType, handlerEvidence)
+			: 0;
+		if (element.id == 0) {
+			element.id = allocator.Alloc(epl_system_id::kTypeFormMenu);
+		}
 		element.isMenu = true;
-		element.name = GetXmlAttribute(child, "名称");
+		element.name = elementName;
 		element.text = GetXmlAttribute(child, "标题");
 		element.visible = GetXmlBoolAttribute(child, "可视", true);
 		element.disable = GetXmlBoolAttribute(child, "禁止", false);
 		element.selected = GetXmlBoolAttribute(child, "选中", false);
 		element.hotKey = GetXmlIntAttribute(child, "快捷键", 0);
 		element.level = level;
-		element.clickEvent = ReadFormMenuClickEventFromXml(
-			child,
-			preferredOwnerClassId,
-			model,
-			preparedHandlers);
+		if (!ReadFormMenuClickEventFromXml(
+				child,
+				preferredOwnerClassId,
+				model,
+				preparedHandlers,
+				handlerEvidence,
+				formName,
+				elementName,
+				element.clickEvent,
+				outError)) {
+			return false;
+		}
 		outElements.push_back(std::move(element));
-		BuildFormMenus(
+		if (!BuildFormMenus(
 			child,
 			level + 1,
+			formName,
 			preferredOwnerClassId,
 			model,
 			preparedHandlers,
 			allocator,
-			outElements);
+			identityPool,
+			outElements,
+			outError)) {
+			return false;
+		}
 	}
+	return true;
 }
 
 bool BuildFormsFromXml(
 	const std::vector<ParsedFormDef>& parsedForms,
 	const std::unordered_map<std::string, std::int32_t>& formClassIds,
 	const std::unordered_map<std::string, std::int32_t>& preferredFormIds,
+	const std::vector<BundleNativeFormSnapshot>* nativeFormSnapshots,
+	const bool nativeFormSnapshotsProveHandlers,
 	const RestoreDocumentModel& model,
 	const std::vector<PreparedFormHandlerSymbol>* preparedHandlers,
 	TypeResolver& resolver,
@@ -8828,9 +9530,30 @@ bool BuildFormsFromXml(
 	for (const auto& formDef : parsedForms) {
 		RestoreForm form;
 		const std::string normalizedFormName = TypeResolver::NormalizeTypeName(formDef.name);
+		const BundleNativeFormSnapshot* nativeFormSnapshot = nullptr;
+		size_t nativeFormSnapshotMatchCount = 0;
+		if (nativeFormSnapshots != nullptr) {
+			for (const auto& candidate : *nativeFormSnapshots) {
+				if (TypeResolver::NormalizeTypeName(candidate.name) == normalizedFormName) {
+					nativeFormSnapshot = &candidate;
+					++nativeFormSnapshotMatchCount;
+				}
+			}
+		}
+		if (nativeFormSnapshotMatchCount != 1) {
+			nativeFormSnapshot = nullptr;
+		}
+		const bool nativeFormSnapshotIdValid =
+			nativeFormSnapshot != nullptr &&
+			nativeFormSnapshot->id != 0 &&
+			epl_system_id::GetType(nativeFormSnapshot->id) == epl_system_id::kTypeForm;
 		if (const auto preferredIt = preferredFormIds.find(normalizedFormName);
 			preferredIt != preferredFormIds.end() && preferredIt->second != 0) {
 			form.id = preferredIt->second;
+			allocator.Observe(form.id);
+		}
+		else if (nativeFormSnapshotIdValid) {
+			form.id = nativeFormSnapshot->id;
 			allocator.Observe(form.id);
 		}
 		else {
@@ -8842,11 +9565,20 @@ bool BuildFormsFromXml(
 		}
 		form.name = formDef.name;
 		form.comment = formDef.comment;
+		const bool nativeFormIdentityMatches =
+			nativeFormSnapshotIdValid && nativeFormSnapshot->id == form.id;
+		NativeFormElementIdentityPool identityPool(
+			nativeFormIdentityMatches ? nativeFormSnapshot : nullptr,
+			nativeFormSnapshotsProveHandlers && nativeFormIdentityMatches);
 
 		RestoreFormElement selfElement;
-		selfElement.id = allocator.Alloc(epl_system_id::kTypeFormSelf);
 		selfElement.dataType = 65537;
-
+		const BundleNativeFormElementSnapshot* selfHandlerEvidence = nullptr;
+		selfElement.id = identityPool.Take(
+			std::string(), false, true, selfElement.dataType, selfHandlerEvidence);
+		if (selfElement.id == 0) {
+			selfElement.id = allocator.Alloc(epl_system_id::kTypeFormSelf);
+		}
 		if (formDef.formXml != nullptr) {
 			const std::string xmlText = [&]() {
 				std::ostringstream stream;
@@ -8872,6 +9604,13 @@ bool BuildFormsFromXml(
 			}
 			form.name = GetXmlAttribute(root, "名称").empty() ? form.name : GetXmlAttribute(root, "名称");
 			form.comment = GetXmlAttribute(root, "备注").empty() ? form.comment : GetXmlAttribute(root, "备注");
+			if (TypeResolver::NormalizeTypeName(form.name) != normalizedFormName ||
+				(nativeFormSnapshot != nullptr &&
+					TypeResolver::NormalizeTypeName(nativeFormSnapshot->name) !=
+					TypeResolver::NormalizeTypeName(form.name))) {
+				identityPool.DisableHandlerEvidence();
+				selfHandlerEvidence = nullptr;
+			}
 			selfElement.left = GetXmlIntAttribute(root, "左边", 0);
 			selfElement.top = GetXmlIntAttribute(root, "顶边", 0);
 			selfElement.width = GetXmlIntAttribute(root, "宽度", 0);
@@ -8884,24 +9623,36 @@ bool BuildFormsFromXml(
 			selfElement.locked = GetXmlBoolAttribute(root, "锁定", false);
 			selfElement.tabIndex = GetXmlIntAttribute(root, "停留顺序", 0);
 			selfElement.extensionData = DecodeBase64(GetXmlAttribute(root, "扩展属性数据"));
-			selfElement.events = ReadFormControlEventsFromXml(
-				root,
-				"窗口.事件",
-				form.classId,
-				model,
-				preparedHandlers);
+			if (!ReadFormControlEventsFromXml(
+					root,
+					"窗口.事件",
+					form.classId,
+					model,
+					preparedHandlers,
+					selfHandlerEvidence,
+					form.name,
+					"<form>",
+					selfElement.events,
+					outError)) {
+				return false;
+			}
 
 			form.elements.push_back(selfElement);
 			for (const auto& child : root.children) {
 				if (child.name == "窗口.菜单") {
-					BuildFormMenus(
+					if (!BuildFormMenus(
 						child,
 						0,
+						form.name,
 						form.classId,
 						model,
 						preparedHandlers,
 						allocator,
-						form.elements);
+						&identityPool,
+						form.elements,
+						outError)) {
+						return false;
+					}
 				}
 			}
 			std::vector<std::int32_t> rootChildren;
@@ -8909,16 +9660,21 @@ bool BuildFormsFromXml(
 				if (child.name == "窗口.菜单" || StartsWith(child.name, root.name + ".")) {
 					continue;
 				}
-				BuildFormControlTree(
+				if (!BuildFormControlTree(
 					child,
 					0,
+					form.name,
 					form.classId,
 					model,
 					preparedHandlers,
 					resolver,
 					allocator,
+					&identityPool,
 					form.elements,
-					rootChildren);
+					rootChildren,
+					outError)) {
+					return false;
+				}
 			}
 		}
 		else {
@@ -9321,8 +10077,18 @@ bool BuildRestoreModel(
 		}
 		model.dependencies.push_back(std::move(item));
 	}
-	if (bundle != nullptr) {
-		ApplyNativeDependencyDefinedIds(*bundle, model.dependencies);
+	NativeUnassignedDependencySymbols unassignedDependencySymbols;
+	bool nativeDependencyBindingComplete = false;
+	if (originalBundle != nullptr) {
+		// Only bytes reparsed into the immutable original bundle may authorize IDs
+		// that are missing from a dependency's persisted category ranges.
+		nativeDependencyBindingComplete = ApplyNativeDependencyDefinedIds(
+			*originalBundle,
+			model.dependencies,
+			&unassignedDependencySymbols);
+	}
+	else if (bundle != nullptr) {
+		ApplyNativeDependencyDefinedIds(*bundle, model.dependencies, nullptr);
 	}
 	AssignDependencyChildIdSpans(model.dependencies);
 
@@ -9418,6 +10184,15 @@ bool BuildRestoreModel(
 			originalParsedClasses.push_back(std::move(parsedClass));
 		}
 	}
+	std::vector<ParsedStructDef> originalParsedStructs;
+	if (originalBundle != nullptr && !originalBundle->dataTypeText.empty()) {
+		Page originalStructPage;
+		originalStructPage.typeName = "自定义数据类型";
+		originalStructPage.name = "数据类型";
+		originalStructPage.sourcePath = "src/.数据类型.txt";
+		originalStructPage.lines = SplitLines(RemoveUtf8Bom(originalBundle->dataTypeText));
+		ParseStructPage(originalStructPage, originalParsedStructs);
+	}
 
 	auto formClassMatches = BuildFormClassMatchTable(parsedForms, parsedClasses);
 	if (!explicitWindowBindings.empty()) {
@@ -9433,6 +10208,45 @@ bool BuildRestoreModel(
 	}
 
 	IdAllocator allocator;
+	if (originalBundle != nullptr) {
+		std::vector<std::int32_t> unassignedEvidenceIds;
+		for (const auto& symbol : unassignedDependencySymbols.classes) {
+			unassignedEvidenceIds.push_back(symbol.id);
+		}
+		for (const auto& symbol : unassignedDependencySymbols.structs) {
+			unassignedEvidenceIds.push_back(symbol.id);
+			for (const auto memberId : symbol.memberIds) {
+				unassignedEvidenceIds.push_back(memberId);
+			}
+			for (const auto& member : symbol.members) {
+				unassignedEvidenceIds.push_back(member.id);
+			}
+		}
+		for (const auto& symbol : unassignedDependencySymbols.methods) {
+			unassignedEvidenceIds.push_back(symbol.id);
+			unassignedEvidenceIds.push_back(symbol.ownerClassId);
+			for (const auto paramId : symbol.paramIds) {
+				unassignedEvidenceIds.push_back(paramId);
+			}
+			for (const auto& param : symbol.params) {
+				unassignedEvidenceIds.push_back(param.id);
+			}
+		}
+		ObserveNonZeroNativeEvidenceIds(
+			unassignedEvidenceIds,
+			[&allocator](const std::int32_t id) { allocator.Observe(id); });
+	}
+	const std::vector<BundleNativeFormSnapshot>* nativeFormSnapshots = nullptr;
+	bool nativeFormSnapshotsProveHandlers = false;
+	if (originalBundle != nullptr && !originalBundle->nativeFormSnapshots.empty()) {
+		nativeFormSnapshots = &originalBundle->nativeFormSnapshots;
+		// These snapshots were parsed again from the preserved native project bytes.
+		// The editable JSON projection alone is not trusted to authorize raw ids.
+		nativeFormSnapshotsProveHandlers = true;
+	}
+	else if (bundle != nullptr && !bundle->nativeFormSnapshots.empty()) {
+		nativeFormSnapshots = &bundle->nativeFormSnapshots;
+	}
 	TypeResolver resolver(document.sourcePath, model.dependencies);
 	// EC bridge sources can reference native snapshot types that are absent from
 	// the exported public header. Register only names backed by preserved IDs.
@@ -9491,6 +10305,14 @@ bool BuildRestoreModel(
 		const size_t limit = (std::min)(parsedClasses.size(), (std::min)(bundle->sourceFiles.size(), bundle->nativeSourceSnapshots.size()));
 		for (size_t index = 0; index < limit; ++index) {
 			nativeSourceSnapshotsByIndex[index] = &bundle->nativeSourceSnapshots[index];
+		}
+	}
+	if (nativeFormSnapshots != nullptr) {
+		for (const auto& form : *nativeFormSnapshots) {
+			allocator.Observe(form.id);
+			for (const auto& element : form.elements) {
+				allocator.Observe(element.id);
+			}
 		}
 	}
 	for (const auto& dependency : model.dependencies) {
@@ -9608,28 +10430,61 @@ bool BuildRestoreModel(
 		return nullptr;
 	};
 
-	std::unordered_set<const BundleNativeStructSnapshot*> reusedStructSnapshots;
-	const auto findReusableStructSnapshot = [&](const ParsedStructDef& definition) -> const BundleNativeStructSnapshot* {
+	std::unordered_set<const BundleNativeStructSnapshot*> claimedStructSnapshots;
+	const auto findOriginalParsedStruct = [&](const ParsedStructDef& definition) -> const ParsedStructDef* {
+		const std::string normalizedName = TypeResolver::NormalizeTypeName(definition.name);
+		if (normalizedName.empty()) {
+			return nullptr;
+		}
+		const ParsedStructDef* match = nullptr;
+		for (const auto& candidate : originalParsedStructs) {
+			if (TypeResolver::NormalizeTypeName(candidate.name) != normalizedName) {
+				continue;
+			}
+			if (match != nullptr) {
+				return nullptr;
+			}
+			match = &candidate;
+		}
+		return match;
+	};
+	const auto findNativeStructIdentity = [&](const ParsedStructDef& definition) -> const BundleNativeStructSnapshot* {
 		if (bundle == nullptr) {
 			return nullptr;
 		}
 		const std::string normalizedName = TypeResolver::NormalizeTypeName(definition.name);
 		const std::string digest = ComputeParsedStructDigest(definition);
+		const BundleNativeStructSnapshot* namedMatch = nullptr;
 		for (const auto& candidate : bundle->nativeStructSnapshots) {
-			if (reusedStructSnapshots.contains(&candidate)) {
-				continue;
-			}
-			if (!candidate.name.empty() &&
+			if (claimedStructSnapshots.contains(&candidate) || candidate.name.empty() ||
 				TypeResolver::NormalizeTypeName(candidate.name) != normalizedName) {
 				continue;
 			}
-			if (candidate.textDigest != digest) {
+			if (namedMatch != nullptr) {
+				return nullptr;
+			}
+			namedMatch = &candidate;
+		}
+		if (namedMatch != nullptr) {
+			claimedStructSnapshots.insert(namedMatch);
+			return namedMatch;
+		}
+
+		const BundleNativeStructSnapshot* digestMatch = nullptr;
+		for (const auto& candidate : bundle->nativeStructSnapshots) {
+			if (claimedStructSnapshots.contains(&candidate) || !candidate.name.empty() ||
+				candidate.textDigest != digest) {
 				continue;
 			}
-			reusedStructSnapshots.insert(&candidate);
-			return &candidate;
+			if (digestMatch != nullptr) {
+				return nullptr;
+			}
+			digestMatch = &candidate;
 		}
-		return nullptr;
+		if (digestMatch != nullptr) {
+			claimedStructSnapshots.insert(digestMatch);
+		}
+		return digestMatch;
 	};
 
 	std::unordered_set<const BundleNativeDllSnapshot*> reusedDllSnapshots;
@@ -9721,12 +10576,14 @@ bool BuildRestoreModel(
 		NativeMethodSnapshotMatch identityMatch;
 		std::int32_t id = 0;
 		std::int32_t memoryAddress = 0;
-		bool rebuildRawSupportObjectCalls = false;
+		bool rebuildNativeCode = false;
 	};
 	std::vector<std::vector<PreparedLocalMethod>> preparedLocalMethods(parsedClasses.size());
 	std::vector<size_t> localStructModelIndices;
 	localStructModelIndices.reserve(parsedStructs.size());
 	std::vector<const BundleNativeStructSnapshot*> nativeStructSnapshotsByIndex(parsedStructs.size(), nullptr);
+	std::vector<bool> changedStructShapes(parsedStructs.size(), false);
+	std::vector<std::vector<std::optional<size_t>>> reusableStructMemberSnapshotIndices(parsedStructs.size());
 	std::vector<std::vector<std::int32_t>> localStructMemberIds(parsedStructs.size());
 	std::vector<size_t> localGlobalModelIndices;
 	localGlobalModelIndices.reserve(parsedGlobals.size());
@@ -9741,6 +10598,45 @@ bool BuildRestoreModel(
 	std::vector<std::string> localConstantKeys;
 	localConstantKeys.reserve(parsedConstants.size());
 	std::unordered_map<std::string, int> localConstantKeyCounters;
+	std::unordered_set<std::int32_t> trustedLocalNativeIds;
+	if (originalBundle != nullptr) {
+		for (const auto& snapshot : originalBundle->nativeSourceSnapshots) {
+			trustedLocalNativeIds.insert(snapshot.classId);
+			trustedLocalNativeIds.insert(snapshot.formId);
+			trustedLocalNativeIds.insert(snapshot.classVarIds.begin(), snapshot.classVarIds.end());
+			for (const auto& method : snapshot.methods) {
+				trustedLocalNativeIds.insert(method.id);
+				trustedLocalNativeIds.insert(method.paramIds.begin(), method.paramIds.end());
+				trustedLocalNativeIds.insert(method.localIds.begin(), method.localIds.end());
+			}
+		}
+		for (const auto& snapshot : originalBundle->nativeStructSnapshots) {
+			trustedLocalNativeIds.insert(snapshot.id);
+			trustedLocalNativeIds.insert(snapshot.memberIds.begin(), snapshot.memberIds.end());
+		}
+		for (const auto& snapshot : originalBundle->nativeGlobalSnapshots) {
+			trustedLocalNativeIds.insert(snapshot.id);
+		}
+		for (const auto& snapshot : originalBundle->nativeDllSnapshots) {
+			trustedLocalNativeIds.insert(snapshot.id);
+			trustedLocalNativeIds.insert(snapshot.paramIds.begin(), snapshot.paramIds.end());
+		}
+		for (const auto& snapshot : originalBundle->nativeConstantSnapshots) {
+			trustedLocalNativeIds.insert(snapshot.id);
+		}
+		for (const auto& snapshot : originalBundle->nativeFormSnapshots) {
+			trustedLocalNativeIds.insert(snapshot.id);
+			for (const auto& element : snapshot.elements) {
+				trustedLocalNativeIds.insert(element.id);
+			}
+		}
+		trustedLocalNativeIds.erase(0);
+	}
+	std::unordered_set<std::int32_t> claimedUnassignedEvidenceIds;
+	NativeChildIdRegistry dependencyChildIds;
+	for (const std::int32_t id : trustedLocalNativeIds) {
+		dependencyChildIds.ObserveOccupied(id);
+	}
 	const auto appendDefinedIdRanges = [](RestoreDependencyInfo& dependency, std::vector<std::int32_t> ids) {
 		ids.erase(std::remove(ids.begin(), ids.end(), 0), ids.end());
 		if (!ids.empty()) {
@@ -9753,31 +10649,523 @@ bool BuildRestoreModel(
 			});
 		}
 	};
+	const auto loadDependencyBundle = [&](const RestoreDependencyInfo& dependency,
+		ProjectBundle& outBundle,
+		std::string& outLoadedSourcePath,
+		std::string& outError) {
+		outBundle = {};
+		outLoadedSourcePath.clear();
+		outError.clear();
+		if (!dependency.resolvedPath.empty()) {
+			std::error_code ec;
+			if (std::filesystem::exists(Utf8PathToPath(dependency.resolvedPath), ec)) {
+				Generator generator;
+				if (generator.GenerateBundle(dependency.resolvedPath, outBundle, &outError)) {
+					outLoadedSourcePath = CanonicalizeDependencyMatchPath(
+						dependency.resolvedPath,
+						document.sourcePath);
+					return true;
+				}
+			}
+		}
+		if (!dependency.localWorkspace.empty()) {
+			std::error_code ec;
+			if (std::filesystem::exists(Utf8PathToPath(dependency.localWorkspace), ec)) {
+				BundleDirectoryCodec codec;
+				if (codec.ReadBundle(dependency.localWorkspace, outBundle, &outError)) {
+					outLoadedSourcePath = CanonicalizeDependencyMatchPath(
+						outBundle.sourcePath,
+						dependency.localWorkspace,
+						true);
+					return true;
+				}
+			}
+		}
+		return false;
+	};
 
-	auto importDependencyBundle = [&](RestoreDependencyInfo& dependency) -> bool {
+	std::vector<NativePublicDeclarationOccurrence> publicOwnerOccurrences;
+	std::vector<NativePublicDeclarationOccurrence> publicStructOccurrences;
+	std::vector<NativePublicDeclarationOccurrence> publicMethodOccurrences;
+	std::vector<std::vector<ParsedClassDef>> publicParsedClassesByDependency(model.dependencies.size());
+	std::vector<std::vector<ParsedStructDef>> publicParsedStructsByDependency(model.dependencies.size());
+	std::vector<ProjectBundle> loadedPublicDependencyBundles(model.dependencies.size());
+	std::vector<bool> loadedPublicDependencyBundleValid(model.dependencies.size(), false);
+	std::vector<bool> loadedPublicDependencySourceBindingValid(model.dependencies.size(), false);
+	std::vector<std::string> loadedPublicDependencyErrors(model.dependencies.size());
+	std::unordered_set<std::string> uniqueLoadedPublicDependencySources;
+	bool publicDependencyEvidenceComplete = originalBundle != nullptr && nativeDependencyBindingComplete;
+	for (size_t dependencyIndex = 0; dependencyIndex < model.dependencies.size(); ++dependencyIndex) {
+		const auto& dependency = model.dependencies[dependencyIndex];
+		if (dependency.isSupportLibrary) {
+			continue;
+		}
+		ProjectBundle publicBundle;
+		std::string loadedSourcePath;
+		std::string publicError;
+		if (!loadDependencyBundle(dependency, publicBundle, loadedSourcePath, publicError)) {
+			publicDependencyEvidenceComplete = false;
+			loadedPublicDependencyErrors[dependencyIndex] = std::move(publicError);
+			continue;
+		}
+		const bool canonicalSourceBindingValid =
+			dependency.hasTrustedNativeRecord &&
+			IsCanonicalNativeDependencySourceBinding(NativeDependencySourceBindingEvidence{
+				NormalizeDependencyMatchText(dependency.name),
+				dependency.trustedEditablePath,
+				dependency.trustedNativeName,
+				dependency.trustedNativePath,
+				loadedSourcePath,
+			}) &&
+			uniqueLoadedPublicDependencySources.insert(loadedSourcePath).second;
+		const bool canImportLoadedBundle = CanImportLoadedDependencyBundle(
+			dependency.hasTrustedNativeRecord,
+			canonicalSourceBindingValid);
+		loadedPublicDependencySourceBindingValid[dependencyIndex] = canImportLoadedBundle;
+		loadedPublicDependencyErrors[dependencyIndex] = publicError;
+		if (!canImportLoadedBundle) {
+			publicDependencyEvidenceComplete = false;
+			if (loadedPublicDependencyErrors[dependencyIndex].empty()) {
+				loadedPublicDependencyErrors[dependencyIndex] =
+					"dependency_native_source_binding_mismatch: " + loadedSourcePath;
+			}
+			continue;
+		}
+		loadedPublicDependencyBundles[dependencyIndex] = std::move(publicBundle);
+		loadedPublicDependencyBundleValid[dependencyIndex] = true;
+		if (!dependency.hasTrustedNativeRecord) {
+			publicDependencyEvidenceComplete = false;
+			continue;
+		}
+		try {
+			const Document publicDocument = BuildDocumentFromBundle(
+				loadedPublicDependencyBundles[dependencyIndex]);
+			std::unordered_set<std::string> publicFormNames;
+			for (const auto& form : publicDocument.formXmls) {
+				publicFormNames.insert(TypeResolver::NormalizeTypeName(form.name));
+			}
+			for (const auto& page : publicDocument.pages) {
+				if (page.typeName == "窗口/表单") {
+					publicFormNames.insert(TypeResolver::NormalizeTypeName(page.name));
+				}
+			}
+			for (const auto& page : publicDocument.pages) {
+				if (page.typeName == "自定义数据类型") {
+					std::vector<ParsedStructDef> parsedStructs;
+					ParseStructPage(page, parsedStructs);
+					for (const auto& parsedStruct : parsedStructs) {
+						if (parsedStruct.isPublic) {
+							publicParsedStructsByDependency[dependencyIndex].push_back(parsedStruct);
+							publicStructOccurrences.push_back({
+								dependencyIndex,
+								BuildPublicStructDeclarationKey(parsedStruct),
+							});
+						}
+					}
+					continue;
+				}
+				if (page.typeName != "程序集") {
+					continue;
+				}
+				ParsedClassDef parsedClass;
+				std::string parseError;
+				if (!ParseProgramPage(page, publicFormNames, parsedClass, &parseError)) {
+					publicDependencyEvidenceComplete = false;
+					break;
+				}
+				if (!parsedClass.isPublic) {
+					continue;
+				}
+				publicParsedClassesByDependency[dependencyIndex].push_back(parsedClass);
+				const std::string ownerKey = BuildPublicOwnerDeclarationKey(
+					GetParsedClassNativeKind(parsedClass),
+					TypeResolver::NormalizeTypeName(parsedClass.name));
+				publicOwnerOccurrences.push_back({ dependencyIndex, ownerKey });
+				for (const auto& method : parsedClass.methods) {
+					if (method.isPublic) {
+						publicMethodOccurrences.push_back({
+							dependencyIndex,
+							BuildPublicMethodDeclarationKey(parsedClass, method),
+						});
+					}
+				}
+			}
+		}
+		catch (...) {
+			publicDependencyEvidenceComplete = false;
+		}
+	}
+	std::unordered_map<std::int32_t, std::string> nativeTypeNamesById;
+	std::unordered_set<std::int32_t> ambiguousNativeTypeNameIds;
+	const auto registerNativeTypeName = [&](const std::int32_t id, const std::string& rawName) {
+		const std::string name = TypeResolver::NormalizeTypeName(rawName);
+		if (id == 0 || name.empty() || ambiguousNativeTypeNameIds.contains(id)) {
+			return;
+		}
+		const auto it = nativeTypeNamesById.find(id);
+		if (it != nativeTypeNamesById.end() && it->second != name) {
+			nativeTypeNamesById.erase(it);
+			ambiguousNativeTypeNameIds.insert(id);
+			return;
+		}
+		nativeTypeNamesById.insert_or_assign(id, name);
+	};
+	for (const auto& dependency : model.dependencies) {
+		for (const auto& symbol : dependency.nativeClasses) {
+			registerNativeTypeName(symbol.id, symbol.name);
+		}
+		for (const auto& symbol : dependency.nativeStructs) {
+			registerNativeTypeName(symbol.id, symbol.name);
+		}
+	}
+	for (const auto& symbol : unassignedDependencySymbols.classes) {
+		registerNativeTypeName(symbol.id, symbol.name);
+	}
+	for (const auto& symbol : unassignedDependencySymbols.structs) {
+		registerNativeTypeName(symbol.id, symbol.name);
+	}
+
+	// Reserve every complete child group already assigned to a matched native
+	// dependency before any cursor can consume a sequential slot.
+	std::unordered_set<std::int32_t> nativeSymbolsWithReservedChildEvidence;
+	std::unordered_set<std::int32_t> unstableNativeDependencyReferenceIds;
+	for (size_t dependencyIndex = 0; dependencyIndex < model.dependencies.size(); ++dependencyIndex) {
+		const auto& dependency = model.dependencies[dependencyIndex];
+		if (dependency.isSupportLibrary) {
+			continue;
+		}
+		const size_t ownerToken = dependencyIndex + 1;
+		for (const auto& symbol : dependency.nativeStructs) {
+			std::vector<std::int32_t> ownedIds;
+			std::vector<std::int32_t> childIds;
+			const bool strictEvidence = CollectStrictNativeOwnedIds(
+					symbol.id,
+					epl_system_id::kTypeStruct,
+					symbol.memberIds,
+					symbol.members,
+					epl_system_id::kTypeStructMember,
+					ownedIds,
+					childIds);
+			const bool reserved = strictEvidence && dependencyChildIds.TryReserveGroup(
+					childIds,
+					epl_system_id::kTypeStructMember,
+					ownerToken);
+			if (reserved) {
+				nativeSymbolsWithReservedChildEvidence.insert(symbol.id);
+			}
+			else {
+				for (const std::int32_t id : symbol.memberIds) {
+					if (id != 0) {
+						unstableNativeDependencyReferenceIds.insert(id);
+					}
+				}
+				for (const auto& member : symbol.members) {
+					if (member.id != 0) {
+						unstableNativeDependencyReferenceIds.insert(member.id);
+					}
+				}
+			}
+		}
+		for (const auto& symbol : dependency.nativeMethods) {
+			std::vector<std::int32_t> ownedIds;
+			std::vector<std::int32_t> childIds;
+			if (CollectStrictNativeOwnedIds(
+					symbol.id,
+					epl_system_id::kTypeMethod,
+					symbol.paramIds,
+					symbol.params,
+					epl_system_id::kTypeLocal,
+					ownedIds,
+					childIds)) {
+				if (dependencyChildIds.TryReserveGroup(
+					childIds,
+					epl_system_id::kTypeLocal,
+					ownerToken)) {
+					nativeSymbolsWithReservedChildEvidence.insert(symbol.id);
+				}
+			}
+		}
+	}
+
+	const auto recoverUnassignedDependencySymbols = [&] (
+		RestoreDependencyInfo& dependency,
+		const std::vector<ParsedClassDef>& dependencyClasses,
+		const std::vector<ParsedStructDef>& dependencyStructs,
+		const size_t dependencyIndex) {
+		// Recover symbols omitted by a partial-category dependency record only when
+		// the preserved host bytes and every EC public declaration agree uniquely.
+		const bool canRecoverUnassigned = CanRecoverUnassignedDependencySymbols(
+			originalBundle != nullptr,
+			publicDependencyEvidenceComplete,
+			dependency.hasTrustedNativeDefinedIds,
+			dependency.definedIds.size());
+		const auto nativeTypeMatches = [&](const std::string& rawParsedName, const std::int32_t nativeType) {
+			const std::string parsedName = TypeResolver::NormalizeTypeName(rawParsedName);
+			if (parsedName.empty()) {
+				return nativeType == 0;
+			}
+			if (const std::int32_t resolved = resolver.ResolveTypeId(parsedName);
+				resolved != 0 && resolved == nativeType) {
+				return true;
+			}
+			const auto nativeNameIt = nativeTypeNamesById.find(nativeType);
+			return nativeNameIt != nativeTypeNamesById.end() && nativeNameIt->second == parsedName;
+		};
+		const auto nativeStructSignatureMatches = [&](const ParsedStructDef& parsedStruct, const NativeDependencyStructSymbol& nativeStruct) {
+			if (nativeStruct.members.size() != parsedStruct.members.size()) {
+				return false;
+			}
+			constexpr std::int16_t kSignatureAttrMask =
+				kVarAttrByRef | kVarAttrNullable | kVarAttrArray;
+			for (size_t memberIndex = 0; memberIndex < parsedStruct.members.size(); ++memberIndex) {
+				const auto& parsedMember = parsedStruct.members[memberIndex];
+				const auto& nativeMember = nativeStruct.members[memberIndex];
+				if (TypeResolver::NormalizeTypeName(parsedMember.name) !=
+						TypeResolver::NormalizeTypeName(nativeMember.name) ||
+					!nativeTypeMatches(parsedMember.typeName, nativeMember.dataType) ||
+					(BuildVariableAttr(parsedMember, false, false) & kSignatureAttrMask) !=
+						(nativeMember.attr & kSignatureAttrMask) ||
+					ParseArrayBounds(parsedMember.arrayText) != nativeMember.arrayBounds) {
+					return false;
+				}
+			}
+			return true;
+		};
+		const auto nativeMethodSignatureMatches = [&](const ParsedMethodDef& parsedMethod, const NativeDependencyMethodSymbol& nativeMethod) {
+			if (nativeMethod.params.size() != parsedMethod.params.size() ||
+				!nativeTypeMatches(parsedMethod.returnTypeName, nativeMethod.returnType)) {
+				return false;
+			}
+			constexpr std::int16_t kSignatureAttrMask =
+				kVarAttrByRef | kVarAttrNullable | kVarAttrArray;
+			for (size_t paramIndex = 0; paramIndex < parsedMethod.params.size(); ++paramIndex) {
+				const auto& parsedParam = parsedMethod.params[paramIndex];
+				const auto& nativeParam = nativeMethod.params[paramIndex];
+				if (!nativeTypeMatches(parsedParam.typeName, nativeParam.dataType) ||
+					(BuildVariableAttr(parsedParam, false, false) & kSignatureAttrMask) !=
+						(nativeParam.attr & kSignatureAttrMask) ||
+					ParseArrayBounds(parsedParam.arrayText) != nativeParam.arrayBounds) {
+					return false;
+				}
+			}
+			return true;
+		};
+		const auto collectStructOwnedIds = [](
+			const NativeDependencyStructSymbol& symbol,
+			std::vector<std::int32_t>& outIds,
+			std::vector<std::int32_t>& outChildIds) {
+			return CollectStrictNativeOwnedIds(
+				symbol.id,
+				epl_system_id::kTypeStruct,
+				symbol.memberIds,
+				symbol.members,
+				epl_system_id::kTypeStructMember,
+				outIds,
+				outChildIds);
+		};
+		const auto collectMethodOwnedIds = [](
+			const NativeDependencyMethodSymbol& symbol,
+			std::vector<std::int32_t>& outIds,
+			std::vector<std::int32_t>& outChildIds) {
+			return CollectStrictNativeOwnedIds(
+				symbol.id,
+				epl_system_id::kTypeMethod,
+				symbol.paramIds,
+				symbol.params,
+				epl_system_id::kTypeLocal,
+				outIds,
+				outChildIds);
+		};
+		if (canRecoverUnassigned) {
+			for (const auto& parsedStruct : dependencyStructs) {
+				if (!parsedStruct.isPublic ||
+					!IsUniquePublicDeclarationForDependency(
+						publicStructOccurrences,
+						dependencyIndex,
+						BuildPublicStructDeclarationKey(parsedStruct))) {
+					continue;
+				}
+				const std::string structName = TypeResolver::NormalizeTypeName(parsedStruct.name);
+				const size_t existingStructCount = static_cast<size_t>(std::count_if(
+					dependency.nativeStructs.begin(),
+					dependency.nativeStructs.end(),
+					[&](const NativeDependencyStructSymbol& symbol) {
+						return TypeResolver::NormalizeTypeName(symbol.name) == structName;
+					}));
+				if (existingStructCount != 0) {
+					continue;
+				}
+				const NativeDependencyStructSymbol* uniqueStruct =
+					SelectUniqueUnassignedNativeDependencySymbol(
+						unassignedDependencySymbols.structs,
+						trustedLocalNativeIds,
+						claimedUnassignedEvidenceIds,
+						[&](const NativeDependencyStructSymbol& symbol) {
+							std::vector<std::int32_t> ownedIds;
+							std::vector<std::int32_t> childIds;
+							return epl_system_id::GetType(symbol.id) == epl_system_id::kTypeStruct &&
+								TypeResolver::NormalizeTypeName(symbol.name) == structName &&
+								nativeStructSignatureMatches(parsedStruct, symbol) &&
+								collectStructOwnedIds(symbol, ownedIds, childIds) &&
+								std::none_of(childIds.begin(), childIds.end(), [&](const std::int32_t id) {
+									return dependencyChildIds.IsOccupiedOrReserved(id);
+								}) &&
+								AreNativeEvidenceIdsAvailable(
+									ownedIds,
+									trustedLocalNativeIds,
+									claimedUnassignedEvidenceIds);
+						});
+				if (uniqueStruct != nullptr) {
+					std::vector<std::int32_t> ownedIds;
+					std::vector<std::int32_t> childIds;
+					if (collectStructOwnedIds(*uniqueStruct, ownedIds, childIds) &&
+						dependencyChildIds.TryReserveGroup(
+							childIds,
+							epl_system_id::kTypeStructMember,
+							dependencyIndex + 1)) {
+						dependency.nativeStructs.push_back(*uniqueStruct);
+						nativeSymbolsWithReservedChildEvidence.insert(uniqueStruct->id);
+						ClaimNativeEvidenceIds(ownedIds, claimedUnassignedEvidenceIds);
+					}
+				}
+			}
+			for (const auto& parsedClass : dependencyClasses) {
+				if (!parsedClass.isPublic) {
+					continue;
+				}
+				const std::string className = TypeResolver::NormalizeTypeName(parsedClass.name);
+				const std::int32_t classKind = GetParsedClassNativeKind(parsedClass);
+				const std::string ownerKey = BuildPublicOwnerDeclarationKey(classKind, className);
+				if (!IsUniquePublicDeclarationForDependency(
+						publicOwnerOccurrences,
+						dependencyIndex,
+						ownerKey)) {
+					continue;
+				}
+				const size_t existingClassCount = static_cast<size_t>(std::count_if(
+					dependency.nativeClasses.begin(),
+					dependency.nativeClasses.end(),
+					[&](const NativeDependencyClassSymbol& symbol) {
+						return TypeResolver::NormalizeTypeName(symbol.name) == className;
+					}));
+				if (existingClassCount == 0) {
+					const NativeDependencyClassSymbol* uniqueClass =
+						SelectUniqueUnassignedNativeDependencySymbol(
+							unassignedDependencySymbols.classes,
+							trustedLocalNativeIds,
+							claimedUnassignedEvidenceIds,
+							[&](const NativeDependencyClassSymbol& symbol) {
+								return epl_system_id::GetType(symbol.id) == classKind &&
+									TypeResolver::NormalizeTypeName(symbol.name) == className;
+							});
+					if (uniqueClass != nullptr) {
+						dependency.nativeClasses.push_back(*uniqueClass);
+						claimedUnassignedEvidenceIds.insert(uniqueClass->id);
+					}
+				}
+
+				const NativeDependencyClassSymbol* nativeClass = nullptr;
+				for (const auto& candidate : dependency.nativeClasses) {
+					if (TypeResolver::NormalizeTypeName(candidate.name) != className) {
+						continue;
+					}
+					if (nativeClass != nullptr || epl_system_id::GetType(candidate.id) != classKind) {
+						nativeClass = nullptr;
+						break;
+					}
+					nativeClass = &candidate;
+				}
+				if (nativeClass == nullptr) {
+					continue;
+				}
+
+				for (const auto& parsedMethod : parsedClass.methods) {
+					if (!parsedMethod.isPublic ||
+						!IsUniquePublicDeclarationForDependency(
+							publicMethodOccurrences,
+							dependencyIndex,
+							BuildPublicMethodDeclarationKey(parsedClass, parsedMethod))) {
+						continue;
+					}
+					const std::string methodName = TypeResolver::NormalizeTypeName(parsedMethod.name);
+					const bool alreadyHasMethod = std::any_of(
+						dependency.nativeMethods.begin(),
+						dependency.nativeMethods.end(),
+						[&](const NativeDependencyMethodSymbol& symbol) {
+							return TypeResolver::NormalizeTypeName(symbol.ownerClassName) == className &&
+								TypeResolver::NormalizeTypeName(symbol.name) == methodName;
+						});
+					if (alreadyHasMethod) {
+						continue;
+					}
+					const NativeDependencyMethodSymbol* uniqueMethod =
+						SelectUniqueUnassignedNativeDependencySymbol(
+							unassignedDependencySymbols.methods,
+							trustedLocalNativeIds,
+							claimedUnassignedEvidenceIds,
+							[&](const NativeDependencyMethodSymbol& symbol) {
+								std::vector<std::int32_t> ownedIds;
+								std::vector<std::int32_t> childIds;
+								return epl_system_id::GetType(symbol.id) == epl_system_id::kTypeMethod &&
+									symbol.ownerClassId == nativeClass->id &&
+									TypeResolver::NormalizeTypeName(symbol.ownerClassName) == className &&
+									TypeResolver::NormalizeTypeName(symbol.name) == methodName &&
+									nativeMethodSignatureMatches(parsedMethod, symbol) &&
+									collectMethodOwnedIds(symbol, ownedIds, childIds) &&
+									std::none_of(childIds.begin(), childIds.end(), [&](const std::int32_t id) {
+										return dependencyChildIds.IsOccupiedOrReserved(id);
+									}) &&
+									AreNativeEvidenceIdsAvailable(
+										ownedIds,
+										trustedLocalNativeIds,
+										claimedUnassignedEvidenceIds);
+							});
+					if (uniqueMethod != nullptr) {
+						std::vector<std::int32_t> ownedIds;
+						std::vector<std::int32_t> childIds;
+						if (collectMethodOwnedIds(*uniqueMethod, ownedIds, childIds) &&
+							dependencyChildIds.TryReserveGroup(
+								childIds,
+								epl_system_id::kTypeLocal,
+								dependencyIndex + 1)) {
+							dependency.nativeMethods.push_back(*uniqueMethod);
+							nativeSymbolsWithReservedChildEvidence.insert(uniqueMethod->id);
+							ClaimNativeEvidenceIds(ownedIds, claimedUnassignedEvidenceIds);
+						}
+					}
+				}
+			}
+		}
+
+	};
+	for (size_t dependencyIndex = 0; dependencyIndex < model.dependencies.size(); ++dependencyIndex) {
+		auto& dependency = model.dependencies[dependencyIndex];
+		if (!dependency.isSupportLibrary) {
+			recoverUnassignedDependencySymbols(
+				dependency,
+				publicParsedClassesByDependency[dependencyIndex],
+				publicParsedStructsByDependency[dependencyIndex],
+				dependencyIndex);
+		}
+	}
+	auto importDependencyBundle = [&](RestoreDependencyInfo& dependency, const size_t dependencyIndex) -> bool {
 		if (dependency.isSupportLibrary) {
 			return true;
 		}
 		ProjectBundle dependencyBundle;
-		std::string dependencyError;
-		bool dependencyLoaded = false;
-		if (!dependency.resolvedPath.empty()) {
-			std::error_code ec;
-			if (std::filesystem::exists(Utf8PathToPath(dependency.resolvedPath), ec)) {
-				Generator dependencyGenerator;
-				dependencyLoaded = dependencyGenerator.GenerateBundle(dependency.resolvedPath, dependencyBundle, &dependencyError);
-			}
-		}
-		if (!dependencyLoaded && !dependency.localWorkspace.empty()) {
-			std::error_code ec;
-			if (std::filesystem::exists(Utf8PathToPath(dependency.localWorkspace), ec)) {
-				BundleDirectoryCodec dependencyCodec;
-				dependencyLoaded = dependencyCodec.ReadBundle(dependency.localWorkspace, dependencyBundle, &dependencyError);
-			}
+		std::string dependencyError = loadedPublicDependencyErrors[dependencyIndex];
+		const bool dependencyLoaded =
+			loadedPublicDependencyBundleValid[dependencyIndex] &&
+			loadedPublicDependencySourceBindingValid[dependencyIndex];
+		if (dependencyLoaded) {
+			dependencyBundle = loadedPublicDependencyBundles[dependencyIndex];
 		}
 		if (!dependencyLoaded) {
 			if (!dependency.nativeClasses.empty() || !dependency.nativeMethods.empty() || !dependency.nativeConstants.empty()) {
-				DependencyImportIdCursor dependencyIds(dependency);
+				DependencyImportIdCursor dependencyIds(
+					dependency,
+					dependencyChildIds,
+					dependencyIndex + 1);
 				if (dependencyIds.HasOriginalRanges()) {
 					dependencyIds.ObserveAll(allocator);
 				}
@@ -9861,6 +11249,8 @@ bool BuildRestoreModel(
 						continue;
 					}
 					const size_t ownerIndex = ensureNativeOnlyOwnerClass(methodSymbol);
+					const bool childEvidenceSafe =
+						nativeSymbolsWithReservedChildEvidence.contains(methodSymbol.id);
 					RestoreMethod method;
 					method.id = methodSymbol.id;
 					allocator.Observe(method.id);
@@ -9878,7 +11268,16 @@ bool BuildRestoreModel(
 							nativeParam != nullptr && nativeParam->id != 0
 								? nativeParam->id
 								: (paramIndex < methodSymbol.paramIds.size() ? methodSymbol.paramIds[paramIndex] : 0);
-						param.id = dependencyIds.AllocChild(allocator, epl_system_id::kTypeLocal, nativeParamId);
+						param.id = dependencyIds.AllocChild(
+							allocator,
+							epl_system_id::kTypeLocal,
+							childEvidenceSafe ? nativeParamId : 0);
+						if (param.id == 0) {
+							if (outError != nullptr) {
+								*outError = "dependency_child_id_exhausted_or_conflicted: " + dependency.name;
+							}
+							return false;
+						}
 						param.dataType = nativeParam != nullptr ? nativeParam->dataType : 0;
 						param.attr = nativeParam != nullptr ? nativeParam->attr : 0;
 						if (nativeParam != nullptr) {
@@ -9924,13 +11323,22 @@ bool BuildRestoreModel(
 			return false;
 		}
 
-		DependencyImportIdCursor dependencyIds(dependency);
+		DependencyImportIdCursor dependencyIds(
+			dependency,
+			dependencyChildIds,
+			dependencyIndex + 1);
 		const bool preserveDefinedIds = dependencyIds.HasOriginalRanges();
 		if (preserveDefinedIds) {
 			dependencyIds.ObserveAll(allocator);
 		}
+		bool dependencyChildAllocationFailed = false;
+		std::string dependencyChildAllocationContext;
 		const auto convertDependencyVariable = [&](const ParsedVariableDef& definition, const std::int32_t idType, const bool allowStatic, const bool allowPublic) {
 			const std::int32_t variableId = dependencyIds.AllocChild(allocator, idType);
+			dependencyChildAllocationFailed = dependencyChildAllocationFailed || variableId == 0;
+			if (variableId == 0 && dependencyChildAllocationContext.empty()) {
+				dependencyChildAllocationContext = "variable=" + definition.name;
+			}
 			return convertVariableWithId(definition, idType, allowStatic, allowPublic, variableId);
 		};
 
@@ -9940,11 +11348,19 @@ bool BuildRestoreModel(
 		std::vector<ParsedStructDef> dependencyStructs;
 		std::vector<ParsedDllDef> dependencyDlls;
 		std::vector<ParsedConstantDef> dependencyConstants;
-		const std::unordered_set<std::string> emptyFormNames;
+		std::unordered_set<std::string> dependencyFormNames;
+		for (const auto& form : dependencyDocument.formXmls) {
+			dependencyFormNames.insert(TypeResolver::NormalizeTypeName(form.name));
+		}
+		for (const auto& page : dependencyDocument.pages) {
+			if (page.typeName == "窗口/表单") {
+				dependencyFormNames.insert(TypeResolver::NormalizeTypeName(page.name));
+			}
+		}
 		for (const auto& page : dependencyDocument.pages) {
 			if (page.typeName == "程序集") {
 				ParsedClassDef parsedClass;
-				if (!ParseProgramPage(page, emptyFormNames, parsedClass, outError)) {
+				if (!ParseProgramPage(page, dependencyFormNames, parsedClass, outError)) {
 					return false;
 				}
 				dependencyClasses.push_back(std::move(parsedClass));
@@ -9965,6 +11381,7 @@ bool BuildRestoreModel(
 			}
 		}
 
+
 		std::unordered_map<std::string, const ParsedStructDef*> dependencyStructByName;
 		for (const auto& parsedStruct : dependencyStructs) {
 			const std::string normalizedName = TypeResolver::NormalizeTypeName(parsedStruct.name);
@@ -9980,12 +11397,18 @@ bool BuildRestoreModel(
 		}
 
 		std::unordered_map<std::string, const NativeDependencyStructSymbol*> dependencyImportedStructSymbolsByName;
+		std::unordered_set<std::string> ambiguousImportedStructNames;
 		for (const auto& symbol : dependency.nativeStructs) {
 			const std::string normalizedName = TypeResolver::NormalizeTypeName(symbol.name);
-			if (normalizedName.empty()) {
+			if (normalizedName.empty() || ambiguousImportedStructNames.contains(normalizedName)) {
 				continue;
 			}
-			dependencyImportedStructSymbolsByName.insert_or_assign(normalizedName, &symbol);
+			if (dependencyImportedStructSymbolsByName.contains(normalizedName)) {
+				dependencyImportedStructSymbolsByName.erase(normalizedName);
+				ambiguousImportedStructNames.insert(normalizedName);
+				continue;
+			}
+			dependencyImportedStructSymbolsByName.emplace(normalizedName, &symbol);
 		}
 
 		std::vector<const BundleNativeStructSnapshot*> dependencyNativeStructSnapshotsByIndex(dependencyStructs.size(), nullptr);
@@ -10070,10 +11493,16 @@ bool BuildRestoreModel(
 		};
 
 		std::unordered_map<std::string, DependencyNativeClassBinding> nativeClassBindings;
+		std::unordered_set<std::int32_t> importedNativeClassIds;
+		std::unordered_set<std::int32_t> importedNativeMethodIds;
+		std::unordered_set<std::int32_t> importedNativeConstantIds;
 		for (const auto& classSymbol : dependency.nativeClasses) {
 			const std::string className = TypeResolver::NormalizeTypeName(classSymbol.name);
 			if (className.empty()) {
 				continue;
+			}
+			if (classSymbol.id != 0) {
+				importedNativeClassIds.insert(classSymbol.id);
 			}
 			nativeClassBindings[className].classId = classSymbol.id;
 			nativeClassBindings[className].memoryAddress = classSymbol.memoryAddress;
@@ -10083,6 +11512,9 @@ bool BuildRestoreModel(
 			const std::string methodName = TypeResolver::NormalizeTypeName(methodSymbol.name);
 			if (methodName.empty()) {
 				continue;
+			}
+			if (methodSymbol.id != 0) {
+				importedNativeMethodIds.insert(methodSymbol.id);
 			}
 			const std::string ownerName = TypeResolver::NormalizeTypeName(methodSymbol.ownerClassName);
 			if (!ownerName.empty()) {
@@ -10136,6 +11568,28 @@ bool BuildRestoreModel(
 				}
 			}
 		}
+		for (const auto& constantSymbol : dependency.nativeConstants) {
+			if (constantSymbol.id != 0) {
+				importedNativeConstantIds.insert(constantSymbol.id);
+			}
+		}
+		const auto findImportedConstantSymbol = [&dependency](
+			const std::string& rawName,
+			const std::int32_t expectedType) -> const NativeDependencyConstantSymbol* {
+			const std::string name = TypeResolver::NormalizeTypeName(rawName);
+			const NativeDependencyConstantSymbol* unique = nullptr;
+			for (const auto& symbol : dependency.nativeConstants) {
+				if (epl_system_id::GetType(symbol.id) != expectedType ||
+					TypeResolver::NormalizeTypeName(symbol.name) != name) {
+					continue;
+				}
+				if (unique != nullptr) {
+					return nullptr;
+				}
+				unique = &symbol;
+			}
+			return unique;
+		};
 
 		const auto findNativeClassBinding = [&](const ParsedClassDef& parsedClass) -> DependencyNativeClassBinding* {
 			const auto it = nativeClassBindings.find(TypeResolver::NormalizeTypeName(parsedClass.name));
@@ -10191,10 +11645,14 @@ bool BuildRestoreModel(
 			}
 			if (modelStructIndex == (std::numeric_limits<size_t>::max)()) {
 				RestoreStruct item;
-				item.id =
-					preferredStructId != 0
+				item.id = importedStructSymbol != nullptr && preferredStructId != 0
+					? dependencyIds.AllocTopLevelFromImportedSymbol(
+						allocator,
+						epl_system_id::kTypeStruct,
+						preferredStructId)
+					: (preferredStructId != 0
 						? dependencyIds.AllocTopLevel(allocator, epl_system_id::kTypeStruct, preferredStructId)
-						: dependencyIds.AllocTopLevel(allocator, epl_system_id::kTypeStruct);
+						: dependencyIds.AllocTopLevel(allocator, epl_system_id::kTypeStruct));
 				item.memoryAddress =
 					importedStructSymbol != nullptr && importedStructSymbol->memoryAddress != 0
 						? importedStructSymbol->memoryAddress
@@ -10228,10 +11686,16 @@ bool BuildRestoreModel(
 			const auto hiddenNativeIt = nativeClassBindings.find(TypeResolver::NormalizeTypeName("__HIDDEN_TEMP_MOD__"));
 			const DependencyNativeClassBinding* hiddenNative =
 				hiddenNativeIt == nativeClassBindings.end() ? nullptr : &hiddenNativeIt->second;
-			hiddenTemp.id = dependencyIds.AllocTopLevel(
-				allocator,
-				epl_system_id::kTypeStaticClass,
-				hiddenNative != nullptr ? hiddenNative->classId : 0);
+			const std::int32_t hiddenNativeClassId = hiddenNative != nullptr ? hiddenNative->classId : 0;
+			hiddenTemp.id = importedNativeClassIds.contains(hiddenNativeClassId)
+				? dependencyIds.AllocTopLevelFromImportedSymbol(
+					allocator,
+					epl_system_id::kTypeStaticClass,
+					hiddenNativeClassId)
+				: dependencyIds.AllocTopLevel(
+					allocator,
+					epl_system_id::kTypeStaticClass,
+					hiddenNativeClassId);
 			hiddenTemp.memoryAddress = hiddenNative != nullptr ? hiddenNative->memoryAddress : 0;
 			hiddenTemp.name = "__HIDDEN_TEMP_MOD__";
 			hiddenTemp.comment = "dependency hidden module";
@@ -10249,10 +11713,12 @@ bool BuildRestoreModel(
 			}
 			DependencyNativeClassBinding* nativeClass = findNativeClassBinding(parsedClass);
 			RestoreClass item;
-			item.id = dependencyIds.AllocTopLevel(
-				allocator,
-				parsedClass.isUserClass ? epl_system_id::kTypeClass : epl_system_id::kTypeStaticClass,
-				nativeClass != nullptr ? nativeClass->classId : 0);
+			const std::int32_t classType =
+				parsedClass.isUserClass ? epl_system_id::kTypeClass : epl_system_id::kTypeStaticClass;
+			const std::int32_t nativeClassId = nativeClass != nullptr ? nativeClass->classId : 0;
+			item.id = importedNativeClassIds.contains(nativeClassId)
+				? dependencyIds.AllocTopLevelFromImportedSymbol(allocator, classType, nativeClassId)
+				: dependencyIds.AllocTopLevel(allocator, classType, nativeClassId);
 			item.memoryAddress = nativeClass != nullptr ? nativeClass->memoryAddress : 0;
 			item.name = parsedClass.name;
 			item.comment = parsedClass.comment;
@@ -10276,6 +11742,7 @@ bool BuildRestoreModel(
 				const auto& member = parsedStruct.members[memberIndex];
 				std::int32_t preferredMemberId = 0;
 				if (binding.importedSymbol != nullptr &&
+					nativeSymbolsWithReservedChildEvidence.contains(binding.importedSymbol->id) &&
 					memberIndex < binding.importedSymbol->memberIds.size()) {
 					preferredMemberId = binding.importedSymbol->memberIds[memberIndex];
 				}
@@ -10288,6 +11755,10 @@ bool BuildRestoreModel(
 					preferredMemberId != 0
 					? dependencyIds.AllocChild(allocator, epl_system_id::kTypeStructMember, preferredMemberId)
 					: dependencyIds.AllocChild(allocator, epl_system_id::kTypeStructMember);
+				dependencyChildAllocationFailed = dependencyChildAllocationFailed || memberId == 0;
+				if (memberId == 0 && dependencyChildAllocationContext.empty()) {
+					dependencyChildAllocationContext = "struct=" + parsedStruct.name + " member=" + member.name;
+				}
 				targetStruct.members.push_back(convertVariableWithId(
 					member,
 					epl_system_id::kTypeStructMember,
@@ -10318,7 +11789,15 @@ bool BuildRestoreModel(
 				continue;
 			}
 			RestoreConstant constant;
-			constant.id = dependencyIds.AllocTopLevel(allocator, epl_system_id::kTypeConstant);
+			const NativeDependencyConstantSymbol* nativeConstant =
+				findImportedConstantSymbol(parsedConstant.name, epl_system_id::kTypeConstant);
+			const std::int32_t nativeConstantId = nativeConstant == nullptr ? 0 : nativeConstant->id;
+			constant.id = importedNativeConstantIds.contains(nativeConstantId)
+				? dependencyIds.AllocTopLevelFromImportedSymbol(
+					allocator,
+					epl_system_id::kTypeConstant,
+					nativeConstantId)
+				: dependencyIds.AllocTopLevel(allocator, epl_system_id::kTypeConstant);
 			constant.attr = kConstAttrHidden;
 			if (parsedConstant.isLongText) {
 				constant.attr |= kConstAttrLongText;
@@ -10334,11 +11813,19 @@ bool BuildRestoreModel(
 				continue;
 			}
 			RestoreConstant constant;
-			constant.id = dependencyIds.AllocTopLevel(
-				allocator,
+			const std::int32_t resourceType =
 				resource.kind == BundleResourceKind::Image
 					? epl_system_id::kTypeImageResource
-					: epl_system_id::kTypeSoundResource);
+					: epl_system_id::kTypeSoundResource;
+			const NativeDependencyConstantSymbol* nativeConstant =
+				findImportedConstantSymbol(resource.logicalName, resourceType);
+			const std::int32_t nativeConstantId = nativeConstant == nullptr ? 0 : nativeConstant->id;
+			constant.id = importedNativeConstantIds.contains(nativeConstantId)
+				? dependencyIds.AllocTopLevelFromImportedSymbol(
+					allocator,
+					resourceType,
+					nativeConstantId)
+				: dependencyIds.AllocTopLevel(allocator, resourceType);
 			constant.attr = kConstAttrHidden;
 			constant.pageType = resource.kind == BundleResourceKind::Image ? kConstPageImage : kConstPageSound;
 			constant.name = resource.logicalName;
@@ -10387,11 +11874,19 @@ bool BuildRestoreModel(
 					nativeMethod = globalNativeIt->second.TakeMethod(parsedMethod.name);
 				}
 			}
+			const bool nativeMethodChildEvidenceSafe = nativeMethod != nullptr &&
+				nativeSymbolsWithReservedChildEvidence.contains(nativeMethod->id);
 			RestoreMethod method;
-			method.id = dependencyIds.AllocTopLevel(
-				allocator,
-				epl_system_id::kTypeMethod,
-				nativeMethod != nullptr ? nativeMethod->id : 0);
+			const std::int32_t nativeMethodId = nativeMethod != nullptr ? nativeMethod->id : 0;
+			method.id = importedNativeMethodIds.contains(nativeMethodId)
+				? dependencyIds.AllocTopLevelFromImportedSymbol(
+					allocator,
+					epl_system_id::kTypeMethod,
+					nativeMethodId)
+				: dependencyIds.AllocTopLevel(
+					allocator,
+					epl_system_id::kTypeMethod,
+					nativeMethodId);
 			method.memoryAddress = nativeMethod != nullptr ? nativeMethod->memoryAddress : 0;
 			method.ownerClass = ownerClass.id;
 			method.attr =
@@ -10408,30 +11903,34 @@ bool BuildRestoreModel(
 					: ensureTypeId(parsedMethod.returnTypeName);
 			method.name = parsedMethod.name;
 			method.comment = parsedMethod.comment;
-			method.lineOffset = nativeMethod != nullptr ? nativeMethod->lineOffset : std::vector<std::uint8_t>{};
-			method.blockOffset = nativeMethod != nullptr ? nativeMethod->blockOffset : std::vector<std::uint8_t>{};
-			method.methodReference = nativeMethod != nullptr ? nativeMethod->methodReference : std::vector<std::uint8_t>{};
-			method.variableReference = nativeMethod != nullptr ? nativeMethod->variableReference : std::vector<std::uint8_t>{};
-			method.constantReference = nativeMethod != nullptr ? nativeMethod->constantReference : std::vector<std::uint8_t>{};
-			method.expressionData = nativeMethod != nullptr ? nativeMethod->expressionData : std::vector<std::uint8_t>{};
+			method.lineOffset = nativeMethodChildEvidenceSafe ? nativeMethod->lineOffset : std::vector<std::uint8_t>{};
+			method.blockOffset = nativeMethodChildEvidenceSafe ? nativeMethod->blockOffset : std::vector<std::uint8_t>{};
+			method.methodReference = nativeMethodChildEvidenceSafe ? nativeMethod->methodReference : std::vector<std::uint8_t>{};
+			method.variableReference = nativeMethodChildEvidenceSafe ? nativeMethod->variableReference : std::vector<std::uint8_t>{};
+			method.constantReference = nativeMethodChildEvidenceSafe ? nativeMethod->constantReference : std::vector<std::uint8_t>{};
+			method.expressionData = nativeMethodChildEvidenceSafe ? nativeMethod->expressionData : std::vector<std::uint8_t>{};
 			const size_t paramCount =
-				nativeMethod != nullptr
+				nativeMethodChildEvidenceSafe
 					? (std::max)(parsedMethod.params.size(), nativeMethod->params.size())
 					: parsedMethod.params.size();
 			for (size_t paramIndex = 0; paramIndex < paramCount; ++paramIndex) {
 				const ParsedVariableDef* parsedParam =
 					paramIndex < parsedMethod.params.size() ? &parsedMethod.params[paramIndex] : nullptr;
 				const NativeDependencyMethodParamSymbol* nativeParam =
-					nativeMethod != nullptr && paramIndex < nativeMethod->params.size()
+					nativeMethodChildEvidenceSafe && paramIndex < nativeMethod->params.size()
 						? &nativeMethod->params[paramIndex]
 						: nullptr;
 				const std::int32_t nativeParamId =
 					nativeParam != nullptr && nativeParam->id != 0
 						? nativeParam->id
-						: (nativeMethod != nullptr && paramIndex < nativeMethod->paramIds.size()
+					: (nativeMethodChildEvidenceSafe && paramIndex < nativeMethod->paramIds.size()
 							? nativeMethod->paramIds[paramIndex]
 							: 0);
 				const std::int32_t paramId = dependencyIds.AllocChild(allocator, epl_system_id::kTypeLocal, nativeParamId);
+				dependencyChildAllocationFailed = dependencyChildAllocationFailed || paramId == 0;
+				if (paramId == 0 && dependencyChildAllocationContext.empty()) {
+					dependencyChildAllocationContext = "method=" + parsedMethod.name + " param_index=" + std::to_string(paramIndex);
+				}
 				if (nativeParam != nullptr) {
 					RestoreVariable param;
 					param.id = paramId;
@@ -10541,6 +12040,8 @@ bool BuildRestoreModel(
 				}
 
 				const ParsedMethodDef* parsedMethod = findParsedMethodForNative(nativeMethod);
+				const bool nativeMethodChildEvidenceSafe =
+					nativeSymbolsWithReservedChildEvidence.contains(nativeMethod.id);
 				size_t ownerIndex = hiddenTempClassIndex;
 				if (nativeMethod.ownerClassId != 0) {
 					if (const auto ownerIt = importedOwnerById.find(nativeMethod.ownerClassId); ownerIt != importedOwnerById.end()) {
@@ -10557,7 +12058,10 @@ bool BuildRestoreModel(
 				}
 
 				RestoreMethod method;
-				method.id = dependencyIds.AllocTopLevel(allocator, epl_system_id::kTypeMethod, nativeMethod.id);
+				method.id = dependencyIds.AllocTopLevelFromImportedSymbol(
+					allocator,
+					epl_system_id::kTypeMethod,
+					nativeMethod.id);
 				method.memoryAddress = nativeMethod.memoryAddress;
 				method.ownerClass = model.classes[ownerIndex].id;
 				method.attr = nativeMethod.attr != 0
@@ -10572,15 +12076,17 @@ bool BuildRestoreModel(
 					: (parsedMethod != nullptr ? ensureTypeId(parsedMethod->returnTypeName) : 0);
 				method.name = nativeMethod.name;
 				method.comment = parsedMethod != nullptr ? parsedMethod->comment : std::string();
-				method.lineOffset = nativeMethod.lineOffset;
-				method.blockOffset = nativeMethod.blockOffset;
-				method.methodReference = nativeMethod.methodReference;
-				method.variableReference = nativeMethod.variableReference;
-				method.constantReference = nativeMethod.constantReference;
-				method.expressionData = nativeMethod.expressionData;
+				method.lineOffset = nativeMethodChildEvidenceSafe ? nativeMethod.lineOffset : std::vector<std::uint8_t>{};
+				method.blockOffset = nativeMethodChildEvidenceSafe ? nativeMethod.blockOffset : std::vector<std::uint8_t>{};
+				method.methodReference = nativeMethodChildEvidenceSafe ? nativeMethod.methodReference : std::vector<std::uint8_t>{};
+				method.variableReference = nativeMethodChildEvidenceSafe ? nativeMethod.variableReference : std::vector<std::uint8_t>{};
+				method.constantReference = nativeMethodChildEvidenceSafe ? nativeMethod.constantReference : std::vector<std::uint8_t>{};
+				method.expressionData = nativeMethodChildEvidenceSafe ? nativeMethod.expressionData : std::vector<std::uint8_t>{};
 
 				const size_t parsedParamCount = parsedMethod != nullptr ? parsedMethod->params.size() : 0;
-				const size_t nativeParamCount = (std::max)(nativeMethod.params.size(), nativeMethod.paramIds.size());
+				const size_t nativeParamCount = nativeMethodChildEvidenceSafe
+					? (std::max)(nativeMethod.params.size(), nativeMethod.paramIds.size())
+					: 0;
 				const size_t paramCount = (std::max)(parsedParamCount, nativeParamCount);
 				for (size_t paramIndex = 0; paramIndex < paramCount; ++paramIndex) {
 					const ParsedVariableDef* parsedParam =
@@ -10588,12 +12094,20 @@ bool BuildRestoreModel(
 							? &parsedMethod->params[paramIndex]
 							: nullptr;
 					const NativeDependencyMethodParamSymbol* nativeParam =
-						paramIndex < nativeMethod.params.size() ? &nativeMethod.params[paramIndex] : nullptr;
+						nativeMethodChildEvidenceSafe && paramIndex < nativeMethod.params.size()
+							? &nativeMethod.params[paramIndex]
+							: nullptr;
 					const std::int32_t nativeParamId =
 						nativeParam != nullptr && nativeParam->id != 0
 							? nativeParam->id
-							: (paramIndex < nativeMethod.paramIds.size() ? nativeMethod.paramIds[paramIndex] : 0);
+							: (nativeMethodChildEvidenceSafe && paramIndex < nativeMethod.paramIds.size()
+								? nativeMethod.paramIds[paramIndex]
+								: 0);
 					const std::int32_t paramId = dependencyIds.AllocChild(allocator, epl_system_id::kTypeLocal, nativeParamId);
+					dependencyChildAllocationFailed = dependencyChildAllocationFailed || paramId == 0;
+					if (paramId == 0 && dependencyChildAllocationContext.empty()) {
+						dependencyChildAllocationContext = "native_method=" + nativeMethod.name + " param_index=" + std::to_string(paramIndex);
+					}
 					if (nativeParam != nullptr) {
 						RestoreVariable param;
 						param.id = paramId;
@@ -10684,23 +12198,171 @@ bool BuildRestoreModel(
 		if (!preserveDefinedIds) {
 			appendDefinedIdRanges(dependency, definedIdsForSection);
 		}
+		if (dependencyChildAllocationFailed) {
+			if (outError != nullptr) {
+				*outError = "dependency_child_id_exhausted_or_conflicted: " + dependency.name;
+				if (!dependencyChildAllocationContext.empty()) {
+					*outError += " " + dependencyChildAllocationContext;
+				}
+			}
+			return false;
+		}
 		return true;
 	};
 
-	for (auto& dependency : model.dependencies) {
-		if (!dependency.isSupportLibrary && !importDependencyBundle(dependency)) {
+	for (size_t dependencyIndex = 0; dependencyIndex < model.dependencies.size(); ++dependencyIndex) {
+		auto& dependency = model.dependencies[dependencyIndex];
+		if (!dependency.isSupportLibrary && !importDependencyBundle(dependency, dependencyIndex)) {
 			return false;
 		}
 	}
 
+	std::vector<bool> changedClassKinds(parsedClasses.size(), false);
+	std::vector<bool> changedClassShapes(parsedClasses.size(), false);
+	std::vector<bool> changedClassMethodInventories(parsedClasses.size(), false);
+	std::vector<std::vector<std::optional<size_t>>> reusableClassVariableSnapshotIndices(parsedClasses.size());
+	std::unordered_set<std::int32_t> changedClassNativeReferenceIds;
 	for (size_t classIndex = 0; classIndex < parsedClasses.size(); ++classIndex) {
 		const auto& parsedClass = parsedClasses[classIndex];
 		const BundleNativeSourceFileSnapshot* nativeSourceSnapshot =
 			classIndex < nativeSourceSnapshotsByIndex.size() ? nativeSourceSnapshotsByIndex[classIndex] : nullptr;
+		if (nativeSourceSnapshot != nullptr) {
+			// The exporter can omit an empty base-class field from a native user class.
+			// Keep that proven native owner kind while the saved source header is
+			// unchanged, and rebuild only after an explicit header-kind edit.
+			bool originalKindChanged = false;
+			if (classIndex < originalParsedClasses.size()) {
+				const auto& originalClass = originalParsedClasses[classIndex];
+				originalKindChanged = parsedClass.isFormClass != originalClass.isFormClass ||
+					parsedClass.isUserClass != originalClass.isUserClass;
+			}
+			changedClassKinds[classIndex] = originalKindChanged;
+
+			const std::string parsedShapeDigest = ComputeParsedClassShapeDigest(parsedClass);
+			bool snapshotShapeMismatch = false;
+			if (!nativeSourceSnapshot->classShapeDigest.empty()) {
+				snapshotShapeMismatch = nativeSourceSnapshot->classShapeDigest != parsedShapeDigest;
+			}
+			else if (classIndex < originalParsedClasses.size()) {
+				snapshotShapeMismatch =
+					ComputeParsedClassShapeDigest(originalParsedClasses[classIndex]) != parsedShapeDigest;
+			}
+			changedClassShapes[classIndex] = changedClassKinds[classIndex] || snapshotShapeMismatch;
+			if (changedClassKinds[classIndex] && nativeSourceSnapshot->classId != 0) {
+				changedClassNativeReferenceIds.insert(nativeSourceSnapshot->classId);
+			}
+
+			auto& reusableVariableIndices = reusableClassVariableSnapshotIndices[classIndex];
+			reusableVariableIndices.resize(parsedClass.vars.size());
+			if (!changedClassKinds[classIndex]) {
+				if (!changedClassShapes[classIndex]) {
+					for (size_t variableIndex = 0; variableIndex < parsedClass.vars.size(); ++variableIndex) {
+						reusableVariableIndices[variableIndex] = variableIndex;
+					}
+				}
+				else if (classIndex < originalParsedClasses.size()) {
+					const auto& originalClass = originalParsedClasses[classIndex];
+					const size_t nativeVariableCount = (std::max)(
+						nativeSourceSnapshot->classVarIds.size(),
+						nativeSourceSnapshot->classVarTypes.size());
+					std::vector<bool> usedOriginalVariables;
+					for (size_t variableIndex = 0; variableIndex < parsedClass.vars.size(); ++variableIndex) {
+						const std::optional<size_t> originalVariableIndex =
+							FindReusableVariableIndexByName(
+								originalClass.vars,
+								nativeVariableCount,
+								usedOriginalVariables,
+								parsedClass.vars[variableIndex]);
+						if (originalVariableIndex.has_value() &&
+							ComputeParsedVariableDigest(originalClass.vars[*originalVariableIndex]) ==
+								ComputeParsedVariableDigest(parsedClass.vars[variableIndex])) {
+							reusableVariableIndices[variableIndex] = originalVariableIndex;
+						}
+					}
+				}
+			}
+			std::unordered_set<size_t> reusedNativeVariableIndices;
+			for (const auto reusableIndex : reusableVariableIndices) {
+				if (reusableIndex.has_value()) {
+					reusedNativeVariableIndices.insert(*reusableIndex);
+				}
+			}
+			for (size_t nativeVariableIndex = 0;
+				nativeVariableIndex < nativeSourceSnapshot->classVarIds.size();
+				++nativeVariableIndex) {
+				if (!reusedNativeVariableIndices.contains(nativeVariableIndex) &&
+					nativeSourceSnapshot->classVarIds[nativeVariableIndex] != 0) {
+					changedClassNativeReferenceIds.insert(nativeSourceSnapshot->classVarIds[nativeVariableIndex]);
+				}
+			}
+
+			const ParsedClassDef* originalClass =
+				classIndex < originalParsedClasses.size() ? &originalParsedClasses[classIndex] : nullptr;
+			const auto nativeMethodName = [&](const size_t methodIndex) {
+				std::string name = methodIndex < nativeSourceSnapshot->methods.size()
+					? nativeSourceSnapshot->methods[methodIndex].name
+					: std::string();
+				if (name.empty() && originalClass != nullptr && methodIndex < originalClass->methods.size()) {
+					name = originalClass->methods[methodIndex].name;
+				}
+				return TypeResolver::NormalizeTypeName(name);
+			};
+			bool methodInventoryChanged =
+				nativeSourceSnapshot->methods.size() != parsedClass.methods.size();
+			const size_t sharedMethodCount = (std::min)(
+				nativeSourceSnapshot->methods.size(),
+				parsedClass.methods.size());
+			for (size_t methodIndex = 0; methodIndex < sharedMethodCount; ++methodIndex) {
+				if (nativeMethodName(methodIndex) !=
+					TypeResolver::NormalizeTypeName(parsedClass.methods[methodIndex].name)) {
+					methodInventoryChanged = true;
+					break;
+				}
+				if (originalClass != nullptr && methodIndex < originalClass->methods.size() &&
+					BuildParsedMethodDeclarationSignature(originalClass->methods[methodIndex]) !=
+						BuildParsedMethodDeclarationSignature(parsedClass.methods[methodIndex])) {
+					methodInventoryChanged = true;
+					break;
+				}
+			}
+			changedClassMethodInventories[classIndex] = methodInventoryChanged;
+			if (methodInventoryChanged) {
+				for (size_t nativeMethodIndex = 0;
+					nativeMethodIndex < nativeSourceSnapshot->methods.size();
+					++nativeMethodIndex) {
+					const auto& nativeMethod = nativeSourceSnapshot->methods[nativeMethodIndex];
+					if (nativeMethod.id == 0) {
+						continue;
+					}
+					const std::string normalizedName = nativeMethodName(nativeMethodIndex);
+					const ParsedMethodDef* originalMethod =
+						originalClass != nullptr && nativeMethodIndex < originalClass->methods.size()
+							? &originalClass->methods[nativeMethodIndex]
+							: nullptr;
+					const bool stillCompatible = std::any_of(
+						parsedClass.methods.begin(),
+						parsedClass.methods.end(),
+						[&](const ParsedMethodDef& currentMethod) {
+							if (TypeResolver::NormalizeTypeName(currentMethod.name) != normalizedName) {
+								return false;
+							}
+							return originalMethod == nullptr ||
+								BuildParsedMethodDeclarationSignature(currentMethod) ==
+									BuildParsedMethodDeclarationSignature(*originalMethod);
+						});
+					if (!stillCompatible) {
+						changedClassNativeReferenceIds.insert(nativeMethod.id);
+					}
+				}
+			}
+		}
 		RestoreClass item;
-		if (nativeSourceSnapshot != nullptr && nativeSourceSnapshot->classId != 0) {
+		if (nativeSourceSnapshot != nullptr && nativeSourceSnapshot->classId != 0 && !changedClassKinds[classIndex]) {
 			item.id = nativeSourceSnapshot->classId;
-			item.memoryAddress = nativeSourceSnapshot->classMemoryAddress;
+			item.memoryAddress =
+				(changedClassShapes[classIndex] || changedClassMethodInventories[classIndex])
+				? 0
+				: nativeSourceSnapshot->classMemoryAddress;
 			item.formId = nativeSourceSnapshot->formId;
 		}
 		else {
@@ -10718,10 +12380,67 @@ bool BuildRestoreModel(
 		resolver.RegisterUserType(parsedClass.name, model.classes.back().id);
 	}
 
+	std::unordered_set<std::int32_t> changedStructNativeReferenceIds;
 	for (size_t structIndex = 0; structIndex < parsedStructs.size(); ++structIndex) {
 		const auto& parsedStruct = parsedStructs[structIndex];
-		const BundleNativeStructSnapshot* reusableStructSnapshot = findReusableStructSnapshot(parsedStruct);
-		nativeStructSnapshotsByIndex[structIndex] = reusableStructSnapshot;
+		const BundleNativeStructSnapshot* nativeStructSnapshot = findNativeStructIdentity(parsedStruct);
+		nativeStructSnapshotsByIndex[structIndex] = nativeStructSnapshot;
+		const ParsedStructDef* originalParsedStruct = findOriginalParsedStruct(parsedStruct);
+		bool shapeChanged = nativeStructSnapshot != nullptr;
+		if (nativeStructSnapshot != nullptr && !nativeStructSnapshot->textDigest.empty()) {
+			shapeChanged = nativeStructSnapshot->textDigest != ComputeParsedStructDigest(parsedStruct);
+		}
+		else if (nativeStructSnapshot != nullptr && originalParsedStruct != nullptr) {
+			shapeChanged =
+				ComputeParsedStructDigest(*originalParsedStruct) != ComputeParsedStructDigest(parsedStruct);
+		}
+		changedStructShapes[structIndex] = shapeChanged;
+
+		auto& reusableMemberIndices = reusableStructMemberSnapshotIndices[structIndex];
+		reusableMemberIndices.resize(parsedStruct.members.size());
+		if (nativeStructSnapshot != nullptr) {
+			const size_t nativeMemberCount = (std::max)(
+				nativeStructSnapshot->memberIds.size(),
+				nativeStructSnapshot->memberTypes.size());
+			if (!shapeChanged) {
+				for (size_t memberIndex = 0;
+					memberIndex < parsedStruct.members.size() && memberIndex < nativeMemberCount;
+					++memberIndex) {
+					reusableMemberIndices[memberIndex] = memberIndex;
+				}
+			}
+			else if (originalParsedStruct != nullptr) {
+				std::vector<bool> usedOriginalMembers;
+				for (size_t memberIndex = 0; memberIndex < parsedStruct.members.size(); ++memberIndex) {
+					const std::optional<size_t> originalMemberIndex =
+						FindReusableVariableIndexByName(
+							originalParsedStruct->members,
+							nativeMemberCount,
+							usedOriginalMembers,
+							parsedStruct.members[memberIndex]);
+					if (originalMemberIndex.has_value() &&
+						ComputeParsedVariableDigest(originalParsedStruct->members[*originalMemberIndex]) ==
+							ComputeParsedVariableDigest(parsedStruct.members[memberIndex])) {
+						reusableMemberIndices[memberIndex] = originalMemberIndex;
+					}
+				}
+			}
+
+			std::unordered_set<size_t> reusedNativeMemberIndices;
+			for (const auto reusableIndex : reusableMemberIndices) {
+				if (reusableIndex.has_value()) {
+					reusedNativeMemberIndices.insert(*reusableIndex);
+				}
+			}
+			for (size_t nativeMemberIndex = 0;
+				nativeMemberIndex < nativeStructSnapshot->memberIds.size();
+				++nativeMemberIndex) {
+				if (!reusedNativeMemberIndices.contains(nativeMemberIndex) &&
+					nativeStructSnapshot->memberIds[nativeMemberIndex] != 0) {
+					changedStructNativeReferenceIds.insert(nativeStructSnapshot->memberIds[nativeMemberIndex]);
+				}
+			}
+		}
 		size_t modelStructIndex = (std::numeric_limits<size_t>::max)();
 		const std::int32_t existingTypeId = resolver.ResolveTypeId(parsedStruct.name);
 		if (existingTypeId != 0 && resolver.IsPlaceholderType(parsedStruct.name)) {
@@ -10730,7 +12449,10 @@ bool BuildRestoreModel(
 				if (existing.id != existingTypeId || !existing.isPlaceholder) {
 					continue;
 				}
-				existing.memoryAddress = reusableStructSnapshot != nullptr ? reusableStructSnapshot->memoryAddress : 0;
+				existing.memoryAddress =
+					nativeStructSnapshot != nullptr && !shapeChanged
+						? nativeStructSnapshot->memoryAddress
+						: 0;
 				existing.name = parsedStruct.name;
 				existing.comment = parsedStruct.comment;
 				existing.attr = parsedStruct.isPublic ? 0x1 : 0;
@@ -10742,10 +12464,13 @@ bool BuildRestoreModel(
 		if (modelStructIndex == (std::numeric_limits<size_t>::max)()) {
 			RestoreStruct item;
 			item.id =
-				reusableStructSnapshot != nullptr && reusableStructSnapshot->id != 0
-					? reusableStructSnapshot->id
+				nativeStructSnapshot != nullptr && nativeStructSnapshot->id != 0
+					? nativeStructSnapshot->id
 					: allocator.Alloc(epl_system_id::kTypeStruct);
-			item.memoryAddress = reusableStructSnapshot != nullptr ? reusableStructSnapshot->memoryAddress : 0;
+			item.memoryAddress =
+				nativeStructSnapshot != nullptr && !shapeChanged
+					? nativeStructSnapshot->memoryAddress
+					: 0;
 			item.name = parsedStruct.name;
 			item.comment = parsedStruct.comment;
 			item.attr = parsedStruct.isPublic ? 0x1 : 0;
@@ -10756,19 +12481,38 @@ bool BuildRestoreModel(
 		resolver.RegisterUserType(parsedStruct.name, model.structs[modelStructIndex].id);
 		resolver.ClearPlaceholderType(parsedStruct.name);
 	}
+	if (bundle != nullptr) {
+		for (const auto& nativeStructSnapshot : bundle->nativeStructSnapshots) {
+			if (claimedStructSnapshots.contains(&nativeStructSnapshot)) {
+				continue;
+			}
+			if (nativeStructSnapshot.id != 0) {
+				changedStructNativeReferenceIds.insert(nativeStructSnapshot.id);
+			}
+			for (const auto memberId : nativeStructSnapshot.memberIds) {
+				if (memberId != 0) {
+					changedStructNativeReferenceIds.insert(memberId);
+				}
+			}
+		}
+	}
 
 	for (size_t structIndex = 0; structIndex < parsedStructs.size(); ++structIndex) {
 		const auto& parsedStruct = parsedStructs[structIndex];
-		const BundleNativeStructSnapshot* reusableStructSnapshot =
+		const BundleNativeStructSnapshot* nativeStructSnapshot =
 			structIndex < nativeStructSnapshotsByIndex.size() ? nativeStructSnapshotsByIndex[structIndex] : nullptr;
 		auto& memberIds = localStructMemberIds[structIndex];
 		memberIds.reserve(parsedStruct.members.size());
 		for (size_t memberIndex = 0; memberIndex < parsedStruct.members.size(); ++memberIndex) {
 			std::int32_t memberId = 0;
-			if (reusableStructSnapshot != nullptr &&
-				memberIndex < reusableStructSnapshot->memberIds.size() &&
-				reusableStructSnapshot->memberIds[memberIndex] != 0) {
-				memberId = reusableStructSnapshot->memberIds[memberIndex];
+			const std::optional<size_t> reusableNativeMemberIndex =
+				memberIndex < reusableStructMemberSnapshotIndices[structIndex].size()
+					? reusableStructMemberSnapshotIndices[structIndex][memberIndex]
+					: std::nullopt;
+			if (nativeStructSnapshot != nullptr && reusableNativeMemberIndex.has_value() &&
+				*reusableNativeMemberIndex < nativeStructSnapshot->memberIds.size() &&
+				nativeStructSnapshot->memberIds[*reusableNativeMemberIndex] != 0) {
+				memberId = nativeStructSnapshot->memberIds[*reusableNativeMemberIndex];
 			}
 			else {
 				memberId = allocator.Alloc(epl_system_id::kTypeStructMember);
@@ -10776,6 +12520,15 @@ bool BuildRestoreModel(
 			memberIds.push_back(memberId);
 		}
 	}
+
+	std::unordered_set<std::int32_t> invalidNativeReferenceIds =
+		unstableNativeDependencyReferenceIds;
+	invalidNativeReferenceIds.insert(
+		changedClassNativeReferenceIds.begin(),
+		changedClassNativeReferenceIds.end());
+	invalidNativeReferenceIds.insert(
+		changedStructNativeReferenceIds.begin(),
+		changedStructNativeReferenceIds.end());
 
 	for (size_t constantIndex = 0; constantIndex < parsedConstants.size(); ++constantIndex) {
 		const BundleNativeConstantSnapshot* reusableConstantSnapshot =
@@ -10854,13 +12607,23 @@ bool BuildRestoreModel(
 			// library/command ids. Reusing an old expression snapshot here can retain
 			// malformed member-call data that makes the IDE crash while loading the
 			// project, even when the exported method text itself is unchanged.
-			prepared.rebuildRawSupportObjectCalls = HasRawSupportLibraryObjectCall(parsedMethod);
-			prepared.reusableMatch = prepared.rebuildRawSupportObjectCalls
+			prepared.rebuildNativeCode =
+				HasRawSupportLibraryObjectCall(parsedMethod) ||
+				changedClassKinds[classIndex];
+			prepared.reusableMatch = prepared.rebuildNativeCode
 				? NativeMethodSnapshotMatch{}
 				: findNativeMethodSnapshot(parsedMethod, true);
 			prepared.identityMatch = prepared.reusableMatch.snapshot != nullptr
 				? prepared.reusableMatch
 				: findNativeMethodSnapshot(parsedMethod, false);
+			if (!prepared.rebuildNativeCode &&
+				prepared.identityMatch.snapshot != nullptr &&
+				NativeMethodReferencesAnyEvidenceId(
+					*prepared.identityMatch.snapshot,
+					invalidNativeReferenceIds)) {
+				prepared.rebuildNativeCode = true;
+				prepared.reusableMatch = {};
+			}
 			if (prepared.identityMatch.snapshot != nullptr && prepared.identityMatch.snapshot->id != 0) {
 				prepared.id = prepared.identityMatch.snapshot->id;
 				prepared.memoryAddress = prepared.identityMatch.snapshot->memoryAddress;
@@ -10903,8 +12666,10 @@ bool BuildRestoreModel(
 	if (!BuildFormsFromXml(
 			parsedForms,
 			formClassIds,
-			preferredFormIds,
-			model,
+		preferredFormIds,
+		nativeFormSnapshots,
+		nativeFormSnapshotsProveHandlers,
+		model,
 			&preparedFormHandlers,
 			resolver,
 			allocator,
@@ -10918,7 +12683,7 @@ bool BuildRestoreModel(
 		const BundleNativeSourceFileSnapshot* nativeSourceSnapshot =
 			classIndex < nativeSourceSnapshotsByIndex.size() ? nativeSourceSnapshotsByIndex[classIndex] : nullptr;
 		auto& targetClass = model.classes[localClassModelIndices[classIndex]];
-		if (nativeSourceSnapshot != nullptr) {
+		if (nativeSourceSnapshot != nullptr && !changedClassShapes[classIndex]) {
 			targetClass.baseClass = nativeSourceSnapshot->baseClass;
 		}
 		else {
@@ -10932,6 +12697,15 @@ bool BuildRestoreModel(
 					: ensureTypeId(parsedClass.baseClassName));
 		}
 		for (size_t variableIndex = 0; variableIndex < parsedClass.vars.size(); ++variableIndex) {
+			const std::optional<size_t> reusableNativeVariableIndex =
+				classIndex < reusableClassVariableSnapshotIndices.size() &&
+				variableIndex < reusableClassVariableSnapshotIndices[classIndex].size()
+					? reusableClassVariableSnapshotIndices[classIndex][variableIndex]
+					: std::nullopt;
+			const std::int32_t nativeVariableType =
+				reusableNativeVariableIndex.has_value()
+					? vectorTypeAt(nativeSourceSnapshot->classVarTypes, *reusableNativeVariableIndex)
+					: 0;
 			RestoreVariable variable =
 				convertVariableWithId(
 					parsedClass.vars[variableIndex],
@@ -10939,10 +12713,11 @@ bool BuildRestoreModel(
 					false,
 					false,
 					std::nullopt,
-					nativeSourceSnapshot != nullptr ? vectorTypeAt(nativeSourceSnapshot->classVarTypes, variableIndex) : 0);
-			if (nativeSourceSnapshot != nullptr && variableIndex < nativeSourceSnapshot->classVarIds.size() &&
-				nativeSourceSnapshot->classVarIds[variableIndex] != 0) {
-				variable.id = nativeSourceSnapshot->classVarIds[variableIndex];
+					nativeVariableType);
+			if (reusableNativeVariableIndex.has_value() &&
+				*reusableNativeVariableIndex < nativeSourceSnapshot->classVarIds.size() &&
+				nativeSourceSnapshot->classVarIds[*reusableNativeVariableIndex] != 0) {
+				variable.id = nativeSourceSnapshot->classVarIds[*reusableNativeVariableIndex];
 			}
 			targetClass.vars.push_back(std::move(variable));
 		}
@@ -10964,7 +12739,7 @@ bool BuildRestoreModel(
 			method.ownerClass = targetClass.id;
 			const std::int32_t defaultMethodAttr = ComputeDefaultMethodAttr(parsedMethod);
 			method.attr = defaultMethodAttr;
-			if (identityNativeMethodSnapshot != nullptr) {
+			if (identityNativeMethodSnapshot != nullptr && !changedClassKinds[classIndex]) {
 				method.attr = identityNativeMethodSnapshot->attr;
 				if (parsedMethod.isPublic) {
 					method.attr |= 0x8;
@@ -11126,6 +12901,9 @@ bool BuildRestoreModel(
 						resourceConstantIds[resourceIndex]);
 				}
 			}
+			if (identityNativeMethodSnapshot != nullptr) {
+				RegisterRawNativeConstantAliases(*identityNativeMethodSnapshot, nativeObjectEncodeContext);
+			}
 			for (size_t paramIndex = 0; paramIndex < parsedMethod.params.size() && paramIndex < method.params.size(); ++paramIndex) {
 				addNativeObjectVariable(parsedMethod.params[paramIndex].name, method.params[paramIndex].id, method.params[paramIndex].dataType);
 			}
@@ -11151,6 +12929,7 @@ bool BuildRestoreModel(
 				}
 				addNativeObjectVariable(form.name, form.id, form.id);
 				nativeObjectEncodeContext.supportMemberTypeByOwnerType.insert_or_assign(form.id, 65537);
+				nativeObjectEncodeContext.implicitSupportTypeId = 65537;
 				for (const auto& element : form.elements) {
 					if (!element.name.empty() && element.id != 0 && element.dataType != 0) {
 						addNativeObjectVariable(element.name, element.id, element.dataType);
@@ -11225,7 +13004,7 @@ bool BuildRestoreModel(
 				}
 			}
 			const bool canReuseIdentityNativeMethodSnapshot =
-				!preparedMethod.rebuildRawSupportObjectCalls &&
+				!preparedMethod.rebuildNativeCode &&
 				identityNativeMethodSnapshot != nullptr &&
 				originalParsedMethod != nullptr &&
 				(AreParsedMethodsCodeEquivalent(parsedMethod, *originalParsedMethod) ||
@@ -11234,7 +13013,7 @@ bool BuildRestoreModel(
 			const bool methodTextUnchanged =
 				originalParsedMethod != nullptr &&
 				AreParsedMethodsTextuallyEquivalent(parsedMethod, *originalParsedMethod);
-			if (!preparedMethod.rebuildRawSupportObjectCalls &&
+			if (!preparedMethod.rebuildNativeCode &&
 				((reusableNativeMethodSnapshot != nullptr && methodTextUnchanged) ||
 				(canReuseIdentityNativeMethodSnapshot &&
 					methodTextUnchanged) ||
@@ -11255,6 +13034,7 @@ bool BuildRestoreModel(
 				std::string semanticError;
 				std::string reusableLineError;
 				const bool rebuiltWithReusableNativeLines =
+					!changedClassKinds[classIndex] &&
 					originalParsedMethod != nullptr &&
 					TryBuildMethodCodeDataWithReusableNativeLineSegments(
 						parsedMethod.bodyLines,
@@ -11262,6 +13042,7 @@ bool BuildRestoreModel(
 						*identityNativeMethodSnapshot,
 						method,
 						nativeObjectEncodeContext,
+						invalidNativeReferenceIds,
 						&reusableLineError);
 				const bool rebuiltWithSemantic =
 					!rebuiltWithReusableNativeLines &&
@@ -11332,9 +13113,18 @@ bool BuildRestoreModel(
 
 	for (size_t structIndex = 0; structIndex < parsedStructs.size(); ++structIndex) {
 		const auto& parsedStruct = parsedStructs[structIndex];
-		const BundleNativeStructSnapshot* reusableStructSnapshot =
+		const BundleNativeStructSnapshot* nativeStructSnapshot =
 			structIndex < nativeStructSnapshotsByIndex.size() ? nativeStructSnapshotsByIndex[structIndex] : nullptr;
 		for (size_t memberIndex = 0; memberIndex < parsedStruct.members.size(); ++memberIndex) {
+			const std::optional<size_t> reusableNativeMemberIndex =
+				structIndex < reusableStructMemberSnapshotIndices.size() &&
+				memberIndex < reusableStructMemberSnapshotIndices[structIndex].size()
+					? reusableStructMemberSnapshotIndices[structIndex][memberIndex]
+					: std::nullopt;
+			const std::int32_t nativeMemberType =
+				nativeStructSnapshot != nullptr && reusableNativeMemberIndex.has_value()
+					? vectorTypeAt(nativeStructSnapshot->memberTypes, *reusableNativeMemberIndex)
+					: 0;
 			RestoreVariable convertedMember =
 				convertVariableWithId(
 					parsedStruct.members[memberIndex],
@@ -11342,7 +13132,7 @@ bool BuildRestoreModel(
 					false,
 					false,
 					std::nullopt,
-					reusableStructSnapshot != nullptr ? vectorTypeAt(reusableStructSnapshot->memberTypes, memberIndex) : 0);
+					nativeMemberType);
 			if (structIndex < localStructMemberIds.size() &&
 				memberIndex < localStructMemberIds[structIndex].size() &&
 				localStructMemberIds[structIndex][memberIndex] != 0) {
@@ -11819,6 +13609,19 @@ std::string GetPersistedDependencyModulePath(const Dependency& dependency)
 
 bool AreEComDependenciesEquivalent(const ProjectBundle& left, const ProjectBundle& right)
 {
+	const auto sameDefinedIds = [](
+		const std::vector<DependencyDefinedIdRange>& lhs,
+		const std::vector<DependencyDefinedIdRange>& rhs) {
+		if (lhs.size() != rhs.size()) {
+			return false;
+		}
+		for (size_t index = 0; index < lhs.size(); ++index) {
+			if (lhs[index].start != rhs[index].start || lhs[index].count != rhs[index].count) {
+				return false;
+			}
+		}
+		return true;
+	};
 	const auto lhs = CollectEComDependencies(left);
 	const auto rhs = CollectEComDependencies(right);
 	if (lhs.size() != rhs.size()) {
@@ -11829,7 +13632,8 @@ bool AreEComDependenciesEquivalent(const ProjectBundle& left, const ProjectBundl
 		const std::string rightPersistedPath = GetPersistedDependencyModulePath(*rhs[index]);
 		if (lhs[index]->name != rhs[index]->name ||
 			leftPersistedPath != rightPersistedPath ||
-			lhs[index]->reExport != rhs[index]->reExport) {
+			lhs[index]->reExport != rhs[index]->reExport ||
+			!sameDefinedIds(lhs[index]->definedIds, rhs[index]->definedIds)) {
 			return false;
 		}
 	}
@@ -12893,6 +14697,7 @@ std::vector<RestoreClass> ReorderClassesForEmit(
 	ordered.reserve(items.size());
 	std::vector<bool> used(items.size(), false);
 	std::unordered_set<std::int32_t> localClassIds;
+	std::unordered_set<std::string> localClassNames;
 	std::vector<std::pair<std::int32_t, std::string>> localClassTargets;
 
 	const auto appendIndex = [&](const size_t index) {
@@ -12907,7 +14712,8 @@ std::vector<RestoreClass> ReorderClassesForEmit(
 		if (item.name == "__HIDDEN_TEMP_MOD__") {
 			return false;
 		}
-		return localClassIds.contains(item.id);
+		return localClassIds.contains(item.id) ||
+			localClassNames.contains(TypeResolver::NormalizeTypeName(item.name));
 	};
 
 	if (currentBundle != nullptr) {
@@ -12920,29 +14726,35 @@ std::vector<RestoreClass> ReorderClassesForEmit(
 			if (classId != 0) {
 				localClassIds.insert(classId);
 			}
-			localClassTargets.emplace_back(classId, TypeResolver::NormalizeTypeName(sourceFile.logicalName));
+			const std::string normalizedName = TypeResolver::NormalizeTypeName(sourceFile.logicalName);
+			if (!normalizedName.empty()) {
+				localClassNames.insert(normalizedName);
+			}
+			localClassTargets.emplace_back(classId, normalizedName);
 		}
 	}
 
 	for (const auto& [targetId, normalizedName] : localClassTargets) {
+		size_t matchedIndex = (std::numeric_limits<size_t>::max)();
 		for (size_t index = 0; index < items.size(); ++index) {
 			if (used[index]) {
 				continue;
 			}
-			if (targetId != 0) {
-				if (items[index].id == targetId) {
-					appendIndex(index);
-					break;
-				}
-				continue;
-			}
-			if (normalizedName.empty()) {
-				continue;
-			}
-			if (TypeResolver::NormalizeTypeName(items[index].name) == normalizedName) {
-				appendIndex(index);
+			if (targetId != 0 && items[index].id == targetId) {
+				matchedIndex = index;
 				break;
 			}
+		}
+		if (matchedIndex == (std::numeric_limits<size_t>::max)() && !normalizedName.empty()) {
+			for (size_t index = 0; index < items.size(); ++index) {
+				if (!used[index] && TypeResolver::NormalizeTypeName(items[index].name) == normalizedName) {
+					matchedIndex = index;
+					break;
+				}
+			}
+		}
+		if (matchedIndex != (std::numeric_limits<size_t>::max)()) {
+			appendIndex(matchedIndex);
 		}
 	}
 
@@ -13112,7 +14924,10 @@ bool SerializeToModuleBytes(
 		currentBundle != nullptr &&
 		originalBundle != nullptr &&
 		originalResourceSection != nullptr &&
-		AreResourceSectionsEquivalent(*currentBundle, *originalBundle);
+		AreResourceSectionsEquivalent(*currentBundle, *originalBundle) &&
+		// Imported ECom constants are stored in the resource section even though
+		// they are absent from the editable local constant/resource projection.
+		AreEComDependenciesEquivalent(*currentBundle, *originalBundle);
 	const bool reuseEComSection =
 		currentBundle != nullptr &&
 		originalBundle != nullptr &&
@@ -13123,7 +14938,9 @@ bool SerializeToModuleBytes(
 		currentBundle != nullptr &&
 		originalBundle != nullptr &&
 		originalFolderSection != nullptr &&
-		AreFolderSectionsEquivalent(*currentBundle, *originalBundle);
+		AreFolderSectionsEquivalent(*currentBundle, *originalBundle) &&
+		// Symbolic folder keys can stay identical while rebuilt owner IDs change.
+		originalFolderSection->data == folderBytes;
 
 	std::unordered_map<std::uint32_t, SectionEmitInfo> sectionsToEmit;
 	const auto addBuiltSection =

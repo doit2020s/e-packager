@@ -21,6 +21,7 @@
 #include "..\thirdparty\json.hpp"
 #include "EFolderCodec.h"
 #include "PathHelper.h"
+#include "RoundtripEvidencePolicy.h"
 #include "SelfUpdater.h"
 #include "SourceArrayFormatValidator.h"
 #include "SupportLibraryPublicInfo.h"
@@ -123,13 +124,6 @@ void ClearNativeReuseState(e2txt::ProjectBundle& bundle)
 	bundle.nativeStructSnapshots.clear();
 	bundle.nativeDllSnapshots.clear();
 	bundle.nativeConstantSnapshots.clear();
-}
-
-void ClearNativeByteReuseState(e2txt::ProjectBundle& bundle)
-{
-	bundle.nativeBundleDigest.clear();
-	bundle.nativeSourceBytes.clear();
-	bundle.nativeSourceSnapshots.clear();
 }
 
 void ConfigureConsoleForUtf8()
@@ -463,7 +457,11 @@ DependencyModuleExportResult ExportDependencyModules(
 		}
 
 		std::filesystem::path resolvedPath;
-		if (!ResolveDependencyModulePath(sourcePath, dependency.path, resolvedPath)) {
+		const bool resolvedFromAnnotation =
+			!dependency.resolvedPath.empty() &&
+			ResolveDependencyModulePath(sourcePath, dependency.resolvedPath, resolvedPath);
+		if (!resolvedFromAnnotation &&
+			!ResolveDependencyModulePath(sourcePath, dependency.path, resolvedPath)) {
 			e2txt::AddRuntimeWarning(
 				Utf8Literal(u8"未找到易模块依赖：") + dependency.name +
 				" path=" + dependency.path);
@@ -900,6 +898,7 @@ bool BuildEComDependencyFromInput(
 	outDependency.path = "$" + resolvedPath.filename().string();
 	outDependency.reExport = false;
 	outResolvedPath = PathToUtf8(resolvedPath);
+	outDependency.resolvedPath = outResolvedPath;
 	return true;
 }
 
@@ -1152,10 +1151,6 @@ int RunUpdate(
 		}
 	}
 
-	if (addedEcomCount + addedElibCount + addedImageCount + addedAudioCount > 0) {
-		ClearNativeByteReuseState(bundle);
-	}
-
 	if (!codec.WriteBundle(bundle, PathToUtf8(effectiveInputDir), &error)) {
 		return PrintStringResult("update", -1, error.c_str());
 	}
@@ -1198,7 +1193,7 @@ void NormalizeBundleForDigestCompare(e2txt::ProjectBundle& bundle)
 	}
 }
 
-std::string BuildBundleDigestCompareText(const e2txt::ProjectBundle& fromE, const e2txt::ProjectBundle& fromDir)
+std::string BuildBundleDigestCompareText(const e2txt::ProjectBundle& fromE, const e2txt::ProjectBundle& fromDir, bool& matches)
 {
 	e2txt::ProjectBundle normalizedFromE = fromE;
 	e2txt::ProjectBundle normalizedFromDir = fromDir;
@@ -1208,6 +1203,7 @@ std::string BuildBundleDigestCompareText(const e2txt::ProjectBundle& fromE, cons
 	std::ostringstream stream;
 	const std::string digestFromE = e2txt::ComputeBundleDigest(normalizedFromE);
 	const std::string digestFromDir = e2txt::ComputeBundleDigest(normalizedFromDir);
+	matches = digestFromE == digestFromDir;
 	stream
 		<< "digest_from_e=" << digestFromE << "\n"
 		<< "digest_from_dir=" << digestFromDir << "\n"
@@ -1626,8 +1622,9 @@ int RunCompareBundle(const char* inputPath, const char* inputDir, const e2txt::R
 		return PrintStringResult("compare-bundle", -1, generateError.c_str());
 	}
 
-	const std::string summary = BuildBundleDigestCompareText(bundleFromE, rebuiltBundleFromDir);
-	return PrintStringResult("compare-bundle", 0, summary.c_str());
+	bool matches = false;
+	const std::string summary = BuildBundleDigestCompareText(bundleFromE, rebuiltBundleFromDir, matches);
+	return PrintStringResult("compare-bundle", matches ? 0 : -1, summary.c_str());
 }
 
 int RunRoundTrip(
@@ -1801,13 +1798,13 @@ void NormalizeJsonForCompare(json& value)
 
 bool ShouldIgnorePathForRoundTripCompare(const std::string& relativePath)
 {
-	return relativePath == "AGENTS.md" ||
-		relativePath.starts_with("src/.native_");
+	return e2txt::IsRoundtripEvidenceFile(relativePath);
 }
 
 bool CompareJsonFile(
 	const std::filesystem::path& leftPath,
 	const std::filesystem::path& rightPath,
+	const std::string& relativePath,
 	std::string& outSummary)
 {
 	std::vector<std::uint8_t> leftBytes;
@@ -1827,6 +1824,8 @@ bool CompareJsonFile(
 		auto rightJson = json::parse(StripUtf8Bom(std::string(rightBytes.begin(), rightBytes.end())));
 		NormalizeJsonForCompare(leftJson);
 		NormalizeJsonForCompare(rightJson);
+		e2txt::NormalizeRoundtripSourceInfo(leftJson, relativePath);
+		e2txt::NormalizeRoundtripSourceInfo(rightJson, relativePath);
 		if (leftJson == rightJson) {
 			return true;
 		}
@@ -1906,7 +1905,7 @@ bool CompareDirectoryTrees(
 
 		const std::filesystem::path extension = leftPath.extension();
 		if (extension == std::filesystem::path(L".json")) {
-			if (!CompareJsonFile(leftPath, rightIt->second, outSummary)) {
+			if (!CompareJsonFile(leftPath, rightIt->second, relativePath, outSummary)) {
 				return false;
 			}
 			++comparedCount;
@@ -1986,6 +1985,12 @@ int RunVerifyRoundTrip(
 	}
 
 	std::string compareSummary;
+	// 快照编号可在导入模块重建时重新分配，不能以快照字节代替工程语义。
+	// 先比较原候选与二次投影重建的完整 bundle，语义失败仍为硬失败。
+	const std::string roundtripDirectory = roundtripDir.string();
+	if (RunCompareBundle(inputPath, roundtripDirectory.c_str(), readOptions) != EXIT_SUCCESS) {
+		return PrintStringResult("verify-roundtrip", -1, "bundle_roundtrip_mismatch");
+	}
 	if (!CompareDirectoryTrees(originalDir, roundtripDir, compareSummary)) {
 		return PrintStringResult("verify-roundtrip", -1, compareSummary.c_str());
 	}
