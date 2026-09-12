@@ -775,6 +775,17 @@ bool DoPack(
 		return false;
 	}
 
+	const std::string packedSourcePath = PathToUtf8(effectiveOutputPath);
+	if (bundle.sourcePath != packedSourcePath) {
+		// The native project stream persists its own source path. Reusing an exact
+		// bundle snapshot after publishing under another path leaves that identity
+		// pointed at the old file and can make E 5.9 terminate while opening it.
+		bundle.sourcePath = packedSourcePath;
+		// Keep the native symbol/source map as identity evidence. Only the exact
+		// whole-bundle shortcut is stale when the output path changes.
+		bundle.nativeBundleDigest.clear();
+	}
+
 	e2txt::Restorer restorer;
 	std::vector<std::uint8_t> plainBytes;
 	if (bundle.sourceFileKind == e2txt::SourceFileKind::EC) {

@@ -167,8 +167,12 @@ New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
 
 $consoleWorkspace = Join-Path $OutputRoot 'console-workspace'
 $windowWorkspace = Join-Path $OutputRoot 'window-workspace'
-Invoke-Packager @('unpack', $consoleTemplate, $consoleWorkspace, '--main-only')
-Invoke-Packager @('unpack', $windowTemplate, $windowWorkspace, '--main-only')
+$unchangedConsole = Join-Path $OutputRoot 'console-unchanged.e'
+$unchangedWindow = Join-Path $OutputRoot 'window-unchanged.e'
+Copy-Item -LiteralPath $consoleTemplate -Destination $unchangedConsole
+Copy-Item -LiteralPath $windowTemplate -Destination $unchangedWindow
+Invoke-Packager @('unpack', $unchangedConsole, $consoleWorkspace, '--main-only')
+Invoke-Packager @('unpack', $unchangedWindow, $windowWorkspace, '--main-only')
 Assert-RuntimeLayout $consoleWorkspace
 Assert-RuntimeLayout $windowWorkspace
 
@@ -181,15 +185,15 @@ if ($windowMeta.projectSubsystem -ne 'windows') {
     throw "window subsystem mismatch: $($windowMeta.projectSubsystem)"
 }
 
-$unchangedConsole = Join-Path $OutputRoot 'console-unchanged.e'
-$unchangedWindow = Join-Path $OutputRoot 'window-unchanged.e'
+$unchangedConsoleHash = (Get-FileHash -LiteralPath $unchangedConsole -Algorithm SHA256).Hash
+$unchangedWindowHash = (Get-FileHash -LiteralPath $unchangedWindow -Algorithm SHA256).Hash
 Invoke-Packager @('pack', $consoleWorkspace, $unchangedConsole)
 Invoke-Packager @('pack', $windowWorkspace, $unchangedWindow)
-if ((Get-FileHash -LiteralPath $consoleTemplate -Algorithm SHA256).Hash -ne
+if ($unchangedConsoleHash -ne
     (Get-FileHash -LiteralPath $unchangedConsole -Algorithm SHA256).Hash) {
     throw 'unchanged console template is not byte stable'
 }
-if ((Get-FileHash -LiteralPath $windowTemplate -Algorithm SHA256).Hash -ne
+if ($unchangedWindowHash -ne
     (Get-FileHash -LiteralPath $unchangedWindow -Algorithm SHA256).Hash) {
     throw 'unchanged window template is not byte stable'
 }
