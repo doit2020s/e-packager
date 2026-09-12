@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -9,6 +10,10 @@
 
 // 支持库公开信息导出辅助。
 namespace support_library_public_info {
+
+// Convert a support-library window property type to the same public data-type
+// name emitted by the text exporter.
+std::string GetPropertyDataTypeName(std::int16_t propertyType);
 
 // 依赖导出后写回 .module.json 的辅助定位信息。
 struct DependencyAnnotation {
