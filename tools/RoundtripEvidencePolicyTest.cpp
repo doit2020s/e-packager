@@ -3,6 +3,7 @@
 #include "../src/NativeFormIdentityPolicy.h"
 #include "../src/NativeMethodIdentityPolicy.h"
 #include "../src/ProgramPageHeaderPolicy.h"
+#include "../src/DependencyModulePathPolicy.h"
 #include <iostream>
 
 int main()
@@ -12,6 +13,16 @@ int main()
 		if (!condition) { std::cerr << label << '\n'; ++failures; }
 	};
 	using nlohmann::json;
+	const auto storedDependencyPath = e2txt::SelectDependencyModulePathForPersistence(
+		"$JadeView.ec", "C:\\e\\ecom\\JadeView.ec", "C:\\workspace\\JadeView.ec");
+	check(storedDependencyPath.path == "$JadeView.ec" &&
+		storedDependencyPath.source == e2txt::DependencyModulePathSource::Stored,
+		"a stored E module token must survive resolved-path lookup evidence");
+	const auto resolvedDependencyPath = e2txt::SelectDependencyModulePathForPersistence(
+		"", "C:\\e\\ecom\\JadeView.ec", "C:\\workspace\\JadeView.ec");
+	check(resolvedDependencyPath.path == "C:\\e\\ecom\\JadeView.ec" &&
+		resolvedDependencyPath.source == e2txt::DependencyModulePathSource::Resolved,
+		"a resolved path must remain the first fallback when no stored token exists");
 	check(e2txt::IsUserClassProgramHeader(2, ""),
 		"one trailing comma must remain the legacy no-parent class marker");
 	check(e2txt::IsUserClassProgramHeader(4, "<对象>"),

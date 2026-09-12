@@ -29,6 +29,7 @@
 #include "NativeDependencyEvidencePolicy.h"
 #include "NativeFormIdentityPolicy.h"
 #include "NativeMethodIdentityPolicy.h"
+#include "DependencyModulePathPolicy.h"
 #include "PathHelper.h"
 #include "ProgramPageHeaderPolicy.h"
 #include "SimpleXmlDocument.h"
@@ -638,16 +639,15 @@ bool TryReadDependencyWorkspaceSourcePath(
 
 DependencyModulePathSelection SelectPersistedDependencyModulePath(const RestoreDependencyInfo& dependency)
 {
-	if (!dependency.resolvedPath.empty()) {
-		return DependencyModulePathSelection{ dependency.resolvedPath, true };
-	}
-
 	std::string workspaceSourcePath;
-	if (TryReadDependencyWorkspaceSourcePath(dependency.localWorkspace, workspaceSourcePath)) {
-		return DependencyModulePathSelection{ std::move(workspaceSourcePath), true };
-	}
-
-	return DependencyModulePathSelection{ dependency.path, false };
+	TryReadDependencyWorkspaceSourcePath(dependency.localWorkspace, workspaceSourcePath);
+	const DependencyModulePathChoice choice = SelectDependencyModulePathForPersistence(
+		dependency.path,
+		dependency.resolvedPath,
+		workspaceSourcePath);
+	return DependencyModulePathSelection{
+		std::string(choice.path),
+		choice.source != DependencyModulePathSource::Stored };
 }
 
 std::string ExtractSupportLibraryTextName(
