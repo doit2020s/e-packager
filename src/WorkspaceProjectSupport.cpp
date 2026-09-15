@@ -568,7 +568,7 @@ std::string BuildAgentsMarkdown(
 		<< L"\r\n"
 		<< L"## 支持库命令与 RSCProject\r\n"
 		<< L"\r\n"
-		<< L"- 完整解包必须从封包器内置资源释放 `tool\\\\RSCProject.dll`；不要在工程根目录或封包器旁放第二份 DLL，也不要把它当成工程的 `RSCProject.fne`。\r\n"
+		<< L"- `RSCProject.dll` 只使用易语言安装根目录的配套文件；封包器不会把它复制到本工作区、`tool/` 或工程根目录。\r\n"
 		<< L"- 独立封包进程不加载 `RSCProject.fne`。公开名不可用时，必须原样保留 `_Lib<序号>Cmd<编号>` 与 `_Lib<序号>Const<编号>`。\r\n"
 		<< L"- 新写裸函数名按当前工程本地子程序、支持库命令、导入易模块子程序的顺序绑定，避免导入模块同名方法抢占系统支持库命令。\r\n"
 		<< L"- 先经记事本再粘贴能正常，只说明 IDE 重新完成了名称连接；这可以辅助定位，不能代替回包、重新解包和命令编号验证。\r\n"
@@ -763,54 +763,6 @@ bool CopyExecutableToToolDirectory(const std::filesystem::path& outputDir, std::
 	return true;
 }
 
-bool WriteEmbeddedRuntimeToToolDirectory(const std::filesystem::path& outputDir, std::string& outError)
-{
-	const HRSRC resource = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_RSC_PROJECT_DLL), MAKEINTRESOURCEW(10));
-	if (resource == nullptr) {
-		outError = "embedded_rsc_project_resource_missing";
-		return false;
-	}
-	const DWORD resourceSize = SizeofResource(nullptr, resource);
-	const HGLOBAL loadedResource = LoadResource(nullptr, resource);
-	const void* resourceBytes = loadedResource == nullptr ? nullptr : LockResource(loadedResource);
-	if (resourceSize == 0 || resourceBytes == nullptr) {
-		outError = "embedded_rsc_project_resource_invalid";
-		return false;
-	}
-
-	const std::filesystem::path toolDir = outputDir / "tool";
-	std::error_code ec;
-	std::filesystem::create_directories(toolDir, ec);
-	if (ec) {
-		outError = "create_tool_dir_failed: " + PathToUtf8(toolDir);
-		return false;
-	}
-
-	const std::filesystem::path destination = toolDir / "RSCProject.dll";
-	const std::filesystem::path staged = toolDir / "RSCProject.dll.tmp";
-	{
-		std::ofstream output(staged, std::ios::binary | std::ios::trunc);
-		if (!output.is_open()) {
-			outError = "open_embedded_rsc_project_failed: " + PathToUtf8(staged);
-			return false;
-		}
-		output.write(static_cast<const char*>(resourceBytes), static_cast<std::streamsize>(resourceSize));
-		if (!output.good()) {
-			output.close();
-			std::filesystem::remove(staged, ec);
-			outError = "write_embedded_rsc_project_failed: " + PathToUtf8(staged);
-			return false;
-		}
-	}
-
-	if (!MoveFileExW(staged.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-		std::filesystem::remove(staged, ec);
-		outError = "publish_embedded_rsc_project_failed: " + PathToUtf8(destination);
-		return false;
-	}
-	return true;
-}
-
 }  // namespace
 
 static constexpr int kSupportedInfoVersion = 1;
@@ -834,9 +786,6 @@ bool WriteWorkspaceFiles(
 	}
 
 	if (!CopyExecutableToToolDirectory(outputDir, outError)) {
-		return false;
-	}
-	if (options.writeEmbeddedRuntime && !WriteEmbeddedRuntimeToToolDirectory(outputDir, outError)) {
 		return false;
 	}
 

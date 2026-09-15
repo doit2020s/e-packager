@@ -9,7 +9,6 @@ namespace workspace_support {
 struct WorkspaceWriteOptions {
 	std::string defaultPackOutputFileName;
 	bool writeAgentsMarkdown = true;
-	bool writeEmbeddedRuntime = true;
 };
 
 bool WriteWorkspaceFiles(

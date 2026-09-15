@@ -39,25 +39,15 @@ function Write-EText {
 
 function Assert-RuntimeLayout {
     param([Parameter(Mandatory)][string]$Workspace)
-    $toolRuntime = Join-Path $Workspace 'tool\RSCProject.dll'
-    if (-not (Test-Path -LiteralPath $toolRuntime -PathType Leaf) -or
-        (Get-Item -LiteralPath $toolRuntime).Length -le 0) {
-        throw "tool runtime missing: $toolRuntime"
-    }
-    if (Test-Path -LiteralPath (Join-Path $Workspace 'RSCProject.dll')) {
-        throw 'RSCProject.dll must not be copied to the workspace root'
+    $allRuntimes = @(Get-ChildItem -LiteralPath $Workspace -Filter 'RSCProject.dll' -File -Recurse)
+    if ($allRuntimes.Count -ne 0) {
+        throw "RSCProject.dll must remain in the E-language install root and must not be copied into a workspace: count=$($allRuntimes.Count)"
     }
 }
 
 function Assert-SingleEmbeddedRuntime {
     param([Parameter(Mandatory)][string]$Workspace)
     Assert-RuntimeLayout $Workspace
-    $expectedRuntime = [IO.Path]::GetFullPath((Join-Path $Workspace 'tool\RSCProject.dll'))
-    $allRuntimes = @(Get-ChildItem -LiteralPath $Workspace -Filter 'RSCProject.dll' -File -Recurse)
-    if ($allRuntimes.Count -ne 1 -or
-        [IO.Path]::GetFullPath($allRuntimes[0].FullName) -ne $expectedRuntime) {
-        throw "embedded RSCProject layout must contain only the top-level tool runtime: count=$($allRuntimes.Count)"
-    }
 }
 
 function Read-Meta {

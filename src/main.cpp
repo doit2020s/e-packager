@@ -140,7 +140,6 @@ void ConfigureConsoleForUtf8()
 
 struct UnpackOptions {
 	bool writeAgentsMarkdown = true;
-	bool writeEmbeddedRuntime = true;
 	bool writeDependencyArtifacts = true;
 	bool unpackDependencyModules = true;
 	size_t dependencyExportThreadCount = e2txt::kDefaultDependencyExportThreadCount;
@@ -528,7 +527,6 @@ DependencyModuleExportResult ExportDependencyModules(
 		std::string childError;
 		const UnpackOptions childOptions {
 			.writeAgentsMarkdown = false,
-			.writeEmbeddedRuntime = false,
 			.writeDependencyArtifacts = true,
 			.unpackDependencyModules = false,
 			.dependencyExportThreadCount = 1,
@@ -675,7 +673,6 @@ bool DoUnpackInternal(
 		return false;
 	}
 	workspaceOptions.writeAgentsMarkdown = options.writeAgentsMarkdown;
-	workspaceOptions.writeEmbeddedRuntime = options.writeEmbeddedRuntime;
 	if (!workspace_support::WriteWorkspaceFiles(effectiveInputPath, effectiveOutputDir, outError, workspaceOptions)) {
 		return false;
 	}
